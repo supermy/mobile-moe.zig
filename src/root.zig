@@ -82,6 +82,20 @@ pub const Engine = struct {
         return self.active_session.generate(max_tokens);
     }
 
+    /// 生成文本并返回解码后的字符串（调用者负责释放返回的内存）
+    pub fn generateText(self: *Self, text: []const u8, max_tokens: u32) ![]u8 {
+        var token_ids: std.ArrayList(TokenId) = .empty;
+        defer token_ids.deinit(self.allocator);
+        try self.engine.tok.encode(text, &token_ids, self.allocator);
+        try self.active_session.sync(token_ids.items);
+        _ = try self.active_session.generate(max_tokens);
+
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(self.allocator);
+        try self.engine.tok.decode(self.active_session.tokens.items, &result, self.allocator);
+        return result.toOwnedSlice(self.allocator);
+    }
+
     /// 生成下一个 token（通过 Session 维护状态）
     pub fn next(self: *Self, token_id: TokenId, pos: u32) !TokenId {
         return self.active_session.step(token_id, pos);

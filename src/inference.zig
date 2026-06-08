@@ -233,7 +233,7 @@ pub const InferenceEngine = struct {
         if (lw.q_a_proj) |w_ptr| {
             const w = try dequant.dequantize(self.allocator, w_ptr, lw.q_a_proj_type, hp.q_lora_rank * hp.hidden_size);
             defer self.allocator.free(w);
-            matVecMul(self.q_comp, w, self.hidden, hp.q_lora_rank, hp.hidden_size);
+            math.matVecMul(self.q_comp, w, self.hidden, hp.q_lora_rank, hp.hidden_size);
         }
 
         // Q RMSNorm
@@ -247,7 +247,7 @@ pub const InferenceEngine = struct {
         if (lw.q_b_proj) |w_ptr| {
             const w = try dequant.dequantize(self.allocator, w_ptr, lw.q_b_proj_type, n_heads * head_dim * hp.q_lora_rank);
             defer self.allocator.free(w);
-            matVecMul(self.q_out, w, self.q_comp, n_heads * head_dim, hp.q_lora_rank);
+            math.matVecMul(self.q_out, w, self.q_comp, n_heads * head_dim, hp.q_lora_rank);
         }
 
         // ===== 2. KV 压缩投影: hidden[hidden_size] → kv_a_out[kv_lora_rank + qk_rope_head_dim] =====
@@ -257,7 +257,7 @@ pub const InferenceEngine = struct {
         if (lw.kv_a_proj) |w_ptr| {
             const w = try dequant.dequantize(self.allocator, w_ptr, lw.kv_a_proj_type, kv_a_dim * hp.hidden_size);
             defer self.allocator.free(w);
-            matVecMul(self.kv_a_out, w, self.hidden, kv_a_dim, hp.hidden_size);
+            math.matVecMul(self.kv_a_out, w, self.hidden, kv_a_dim, hp.hidden_size);
         }
 
         // 分离 kv_comp 和 k_pe
@@ -300,11 +300,11 @@ pub const InferenceEngine = struct {
         var v_b_w: ?[]const f32 = null;
         if (lw.k_b) |w_ptr| {
             k_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.k_b_type, k_b_dim * kv_rank);
-            matVecMul(self.k_nope_out, k_b_w.?, self.kv_comp, k_b_dim, kv_rank);
+            math.matVecMul(self.k_nope_out, k_b_w.?, self.kv_comp, k_b_dim, kv_rank);
         }
         if (lw.v_b) |w_ptr| {
             v_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.v_b_type, v_b_dim * kv_rank);
-            matVecMul(self.v_out, v_b_w.?, self.kv_comp, v_b_dim, kv_rank);
+            math.matVecMul(self.v_out, v_b_w.?, self.kv_comp, v_b_dim, kv_rank);
         }
         defer {
             if (k_b_w) |w| self.allocator.free(w);
@@ -344,7 +344,7 @@ pub const InferenceEngine = struct {
                     const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
 
                     if (k_b_w) |w| {
-                        matVecMul(self.k_nope_out, w, kv_cached, k_b_dim, kv_rank);
+                        math.matVecMul(self.k_nope_out, w, kv_cached, k_b_dim, kv_rank);
                     }
 
                     const hist_k_nope = self.k_nope_out[h * qk_nope ..][0..qk_nope];
@@ -380,7 +380,7 @@ pub const InferenceEngine = struct {
                     // 历史位置：展开 kv_comp 到 v_out
                     const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
                     if (v_b_w) |w| {
-                        matVecMul(self.v_out, w, kv_cached, v_b_dim, kv_rank);
+                        math.matVecMul(self.v_out, w, kv_cached, v_b_dim, kv_rank);
                     }
                     const hist_v = self.v_out[h * v_dim ..][0..v_dim];
                     for (head_out, hist_v) |*o, v| {
@@ -394,7 +394,7 @@ pub const InferenceEngine = struct {
         if (lw.o_proj) |w_ptr| {
             const w = try dequant.dequantize(self.allocator, w_ptr, lw.o_proj_type, hp.hidden_size * n_heads * v_dim);
             defer self.allocator.free(w);
-            matVecMul(self.hidden, w, self.attn_out, hp.hidden_size, n_heads * v_dim);
+            math.matVecMul(self.hidden, w, self.attn_out, hp.hidden_size, n_heads * v_dim);
         }
     }
 
@@ -420,7 +420,7 @@ pub const InferenceEngine = struct {
         const gate_scores = try self.allocator.alloc(f32, hp.n_routed_experts);
         defer self.allocator.free(gate_scores);
 
-        matVecMul(gate_scores, gate_w, self.hidden, hp.n_routed_experts, hp.hidden_size);
+        math.matVecMul(gate_scores, gate_w, self.hidden, hp.n_routed_experts, hp.hidden_size);
 
         // 路由调度
         const route = try self.sched.route(layer, gate_scores);
@@ -490,13 +490,13 @@ pub const InferenceEngine = struct {
         const gate_w = try dequant.dequantize(self.allocator, lw.dense_gate.?, lw.dense_type, intermediate * hidden);
         defer self.allocator.free(gate_w);
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
 
         // Up 投影
         const up_w = try dequant.dequantize(self.allocator, lw.dense_up.?, lw.dense_type, intermediate * hidden);
         defer self.allocator.free(up_w);
         const up_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
@@ -507,7 +507,7 @@ pub const InferenceEngine = struct {
         const down_w = try dequant.dequantize(self.allocator, lw.dense_down.?, lw.dense_type, hidden * intermediate);
         defer self.allocator.free(down_w);
         const result = try self.allocator.alloc(f32, hidden);
-        matVecMul(result, down_w, up_out, hidden, intermediate);
+        math.matVecMul(result, down_w, up_out, hidden, intermediate);
         self.allocator.free(up_out);
 
         @memcpy(self.hidden, result);
@@ -526,13 +526,13 @@ pub const InferenceEngine = struct {
         const gate_w = try dequant.dequantize(self.allocator, lw.shared_gate.?, lw.shared_type, intermediate * hidden);
         defer self.allocator.free(gate_w);
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
 
         // Up 投影
         const up_w = try dequant.dequantize(self.allocator, lw.shared_up.?, lw.shared_type, intermediate * hidden);
         defer self.allocator.free(up_w);
         const up_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
@@ -543,7 +543,7 @@ pub const InferenceEngine = struct {
         const down_w = try dequant.dequantize(self.allocator, lw.shared_down.?, lw.shared_type, hidden * intermediate);
         defer self.allocator.free(down_w);
         const result = try self.allocator.alloc(f32, hidden);
-        matVecMul(result, down_w, up_out, hidden, intermediate);
+        math.matVecMul(result, down_w, up_out, hidden, intermediate);
         self.allocator.free(up_out);
 
         return result;
@@ -575,13 +575,13 @@ pub const InferenceEngine = struct {
         const gate_w = try dequant.dequantize(self.allocator, lw.expert_gate.? + gate_offset, ggml_type, intermediate * hidden);
         defer self.allocator.free(gate_w);
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
 
         // Up 投影
         const up_w = try dequant.dequantize(self.allocator, lw.expert_up.? + up_offset, ggml_type, intermediate * hidden);
         defer self.allocator.free(up_w);
         const up_out = try self.allocator.alloc(f32, intermediate);
-        matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
@@ -592,7 +592,7 @@ pub const InferenceEngine = struct {
         const down_w = try dequant.dequantize(self.allocator, lw.expert_down.? + down_offset, ggml_type, hidden * intermediate);
         defer self.allocator.free(down_w);
         const result = try self.allocator.alloc(f32, hidden);
-        matVecMul(result, down_w, up_out, hidden, intermediate);
+        math.matVecMul(result, down_w, up_out, hidden, intermediate);
         self.allocator.free(up_out);
 
         return result;
@@ -606,7 +606,7 @@ pub const InferenceEngine = struct {
         }
         const w = try dequant.dequantize(self.allocator, self.weights.output_proj.?, self.weights.output_proj_type, hp.vocab_size * hp.hidden_size);
         defer self.allocator.free(w);
-        matVecMul(self.logits, w, self.hidden, hp.vocab_size, hp.hidden_size);
+        math.matVecMul(self.logits, w, self.hidden, hp.vocab_size, hp.hidden_size);
     }
 
     /// 热节流检查
@@ -620,19 +620,4 @@ pub const InferenceEngine = struct {
     }
 };
 
-/// 矩阵-向量乘法: out = W × x
-/// W: [out_dim × in_dim] 行优先, x: [in_dim], out: [out_dim]
-fn matVecMul(out: []f32, w: []const f32, x: []const f32, out_dim: usize, in_dim: usize) void {
-    std.debug.assert(w.len >= out_dim * in_dim);
-    std.debug.assert(x.len >= in_dim);
-    std.debug.assert(out.len >= out_dim);
 
-    for (0..out_dim) |i| {
-        var sum: f32 = 0;
-        const row = w[i * in_dim ..][0..in_dim];
-        for (row, x) |wv, xv| {
-            sum += wv * xv;
-        }
-        out[i] = sum;
-    }
-}

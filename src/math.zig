@@ -3,20 +3,34 @@
 
 const std = @import("std");
 
-/// RMSNorm: x_norm = x / sqrt(mean(x²) + eps) * weight
+/// RMSNorm: x_norm = x / sqrt(mean(x²) + eps) * weight（SIMD 加速）
 pub fn rmsNorm(out: []f32, x: []const f32, weight: []const f32, eps: f32) void {
     std.debug.assert(out.len == x.len);
     std.debug.assert(out.len == weight.len);
 
-    var ss: f32 = 0;
-    for (x) |v| {
-        ss += v * v;
+    const n = x.len;
+    var ss_vec = @as(Vec4, @splat(0.0));
+    var i: usize = 0;
+    while (i + 4 <= n) : (i += 4) {
+        const v: Vec4 = x[i..][0..4].*;
+        ss_vec += v * v;
     }
-    ss = ss / @as(f32, @floatFromInt(x.len)) + eps;
+    var ss: f32 = @reduce(.Add, ss_vec);
+    while (i < n) : (i += 1) {
+        ss += x[i] * x[i];
+    }
+    ss = ss / @as(f32, @floatFromInt(n)) + eps;
     const inv = 1.0 / @sqrt(ss);
+    const inv_vec = @as(Vec4, @splat(inv));
 
-    for (out, x, weight) |*o, v, w| {
-        o.* = v * inv * w;
+    i = 0;
+    while (i + 4 <= n) : (i += 4) {
+        const v: Vec4 = x[i..][0..4].*;
+        const w: Vec4 = weight[i..][0..4].*;
+        out[i..][0..4].* = v * inv_vec * w;
+    }
+    while (i < n) : (i += 1) {
+        out[i] = x[i] * inv * weight[i];
     }
 }
 
@@ -39,14 +53,49 @@ pub fn mul(out: []f32, a: []const f32, b: []const f32) void {
     }
 }
 
-/// 向量点积
+/// 向量点积（SIMD 加速）
+const Vec4 = @Vector(4, f32);
+
 pub fn dot(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
-    var sum: f32 = 0;
-    for (a, b) |va, vb| {
-        sum += va * vb;
+    const n = a.len;
+    var sum_vec = @as(Vec4, @splat(0.0));
+    var i: usize = 0;
+    while (i + 4 <= n) : (i += 4) {
+        const va: Vec4 = a[i..][0..4].*;
+        const vb: Vec4 = b[i..][0..4].*;
+        sum_vec += va * vb;
+    }
+    var sum: f32 = @reduce(.Add, sum_vec);
+    while (i < n) : (i += 1) {
+        sum += a[i] * b[i];
     }
     return sum;
+}
+
+/// 矩阵-向量乘法: out = W @ x
+/// W: [out_dim, in_dim] row-major, x: [in_dim], out: [out_dim]
+/// 使用 4-wide SIMD 加速内层循环
+pub fn matVecMul(out: []f32, w: []const f32, x: []const f32, out_dim: usize, in_dim: usize) void {
+    std.debug.assert(w.len >= out_dim * in_dim);
+    std.debug.assert(x.len >= in_dim);
+    std.debug.assert(out.len >= out_dim);
+
+    for (0..out_dim) |row| {
+        const w_row = w[row * in_dim ..];
+        var sum_vec = @as(Vec4, @splat(0.0));
+        var j: usize = 0;
+        while (j + 4 <= in_dim) : (j += 4) {
+            const wv: Vec4 = w_row[j..][0..4].*;
+            const xv: Vec4 = x[j..][0..4].*;
+            sum_vec += wv * xv;
+        }
+        var sum: f32 = @reduce(.Add, sum_vec);
+        while (j < in_dim) : (j += 1) {
+            sum += w_row[j] * x[j];
+        }
+        out[row] = sum;
+    }
 }
 
 /// Softmax: out[i] = exp(x[i]) / sum(exp(x))

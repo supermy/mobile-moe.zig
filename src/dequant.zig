@@ -46,6 +46,97 @@ pub fn f16ToF32(h: u16) f32 {
     return @bitCast(f32_bits);
 }
 
+/// F32 → FP16 转换（IEEE 754 舍入到最近偶数）
+pub fn f32ToF16(v: f32) u16 {
+    const bits: u32 = @bitCast(v);
+    const sign: u32 = (bits >> 31) & 0x1;
+    const exp_raw: u32 = (bits >> 23) & 0xFF;
+    const mant: u32 = bits & 0x7FFFFF;
+
+    var e: u32 = undefined;
+    var m: u32 = undefined;
+
+    if (exp_raw == 0) {
+        e = 0;
+        m = 0;
+    } else if (exp_raw == 0xFF) {
+        e = 0x1F;
+        m = mant >> 13;
+        if (mant != 0 and m == 0) m = 1;
+    } else {
+        const exp16 = @as(i32, @intCast(exp_raw)) - 127 + 15;
+        if (exp16 >= 31) {
+            e = 0x1F;
+            m = 0;
+        } else if (exp16 <= 0) {
+            if (exp16 < -10) {
+                e = 0;
+                m = 0;
+            } else {
+                e = 0;
+                m = (mant | 0x800000) >> @as(u5, @intCast(1 - exp16));
+            }
+        } else {
+            e = @intCast(exp16);
+            m = mant >> 13;
+            const round_bits = mant & 0x1FFF;
+            const half = 0x1000;
+            if (round_bits > half or (round_bits == half and (m & 1) == 1)) {
+                m += 1;
+                if (m == 0x400) {
+                    m = 0;
+                    e += 1;
+                }
+            }
+        }
+    }
+
+    return @intCast((sign << 15) | (e << 10) | m);
+}
+
+/// 将 f32 数组量化为 Q8_0 格式
+pub fn quantizeQ8_0(allocator: std.mem.Allocator, data: []const f32) ![]BlockQ8_0 {
+    const n_elements = data.len;
+    const n_blocks = (n_elements + 31) / 32;
+    const blocks = try allocator.alloc(BlockQ8_0, n_blocks);
+    errdefer allocator.free(blocks);
+
+    for (0..n_blocks) |i| {
+        var max_abs: f32 = 0;
+        for (0..32) |j| {
+            const idx = i * 32 + j;
+            if (idx < n_elements) {
+                const v = @abs(data[idx]);
+                if (v > max_abs) max_abs = v;
+            }
+        }
+        const d = if (max_abs > 0) max_abs / 127.0 else 0.0;
+        blocks[i].d = f32ToF16(d);
+        for (0..32) |j| {
+            const idx = i * 32 + j;
+            if (idx < n_elements) {
+                const q = @round(data[idx] / d);
+                blocks[i].qs[j] = @intCast(std.math.clamp(q, -127, 127));
+            } else {
+                blocks[i].qs[j] = 0;
+            }
+        }
+    }
+    return blocks;
+}
+
+/// 将 Q8_0 块数组反量化为 f32（n_elements 可以小于 blocks.len * 32）
+pub fn dequantizeQ8_0Slice(allocator: std.mem.Allocator, blocks: []const BlockQ8_0, n_elements: usize) ![]f32 {
+    const out = try allocator.alloc(f32, n_elements);
+    for (0..n_elements) |idx| {
+        const block_idx = idx / 32;
+        const q_idx = idx % 32;
+        const d = f16ToF32(blocks[block_idx].d);
+        out[idx] = d * @as(f32, @floatFromInt(blocks[block_idx].qs[q_idx]));
+    }
+    return out;
+}
+
 // IQ2_XXS 查找表 (256 × 8 packed bytes)
 // 每项是一个 uint64_t，包含 8 个字节，每个字节代表一个量化网格值
 // 字节值只有三种：0x08=8, 0x19=25, 0x2b=43

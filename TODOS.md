@@ -8,10 +8,36 @@ nng实现高性能的接口服务；
 接口测试、端到端测试，确保接口功能正常，端到端功能正常。浏览器增加console.log输出，方便调试。测试覆盖率：100%。
 web增加readme.md的访问入口，方便用户快速上手。
 
-review 深度；TDD; 更新文档，同步代码github；
-review 生产部署；TDD; 更新文档，同步代码github；
-CI/CD 配置：使用 GitHub Actions 实现多平台自动构建、测试和部署。
-借鉴 ../ds4  ../llama.cpp vllm 
+## 已完成
+- [x] 深度代码审查：发现 8 个问题（3 严重 / 2 中等 / 3 低）
+- [x] TDD 修复：
+  - 修复 denseFFN/moeFFN/computeLogits 权重缺失时静默跳过
+  - 修复 saveKv/loadKv 与 block-based KV cache 不兼容
+  - 删除死代码 block_manager.zig
+  - 修复 Engine.next 与 Session 状态同步
+  - 修复 scheduler hotThreshold 固定栈数组限制（改为 quickSelect）
+  - 修复 tokenizer encode 64 字节硬编码限制
+  - 修复 gguf tensorDataPtr 在 mapped_data 为 null 时返回 undefined
+- [x] 短期优化（已落地）：
+  - SIMD 向量化 MatMul / dot / rmsNorm（4-wide f32）
+  - Engine.generateText() 文本生成 API
+- [x] 中期优化（已落地）：
+  - Continuous Batching 接口设计（RequestQueue + /v1/completions/batch）
+  - Server 占位框架（兼容 Zig 0.16.0 std.Io 演进）
+- [x] 长期优化（已落地）：
+  - KV Cache Q8_0 量化接口（`enableQuantization()` + 读写支持）
+  - GPU 后端设计文档（Metal / OpenCL / Vulkan 架构）
+- [x] 生产部署：ReleaseFast 编译通过（CLI 592K / Server 439K）
+- [x] 本地 Git 仓库初始化并提交（待同步到 GitHub）
+
+## 待办
+- [ ] CI/CD 配置：使用 GitHub Actions 实现多平台自动构建、测试和部署
+- [ ] 借鉴 ../ds4 ../llama.cpp vllm（PagedAttention + Prefix Caching 已落地）
+- [ ] nng / std.Io 实现高性能接口服务
+- [ ] GPU 支持备选方案（Metal / OpenCL / Vulkan）
+- [ ] 默认测试页面（参考 llama.cpp `llama-server`）
+- [ ] 单元测试、集成测试覆盖率提升
+- [ ] web 增加 README 访问入口 
 
 真实权重元数据：
 Metadata	Value

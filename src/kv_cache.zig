@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const HyperParams = @import("model.zig").HyperParams;
+const dequant = @import("dequant.zig");
 
 /// 每个 block 固定容纳的 token 数
 pub const BLOCK_SIZE = 16;
@@ -47,6 +48,17 @@ pub const KVCache = struct {
     /// 当前序列长度
     len: u32,
 
+    // ===== KV Cache 量化（长期：Q8_0）=====
+    /// 是否启用 Q8_0 量化
+    quantized: bool,
+    /// [n_layers, num_blocks, block_size, kv_q8_per_token]
+    kv_q8: ?[]dequant.BlockQ8_0,
+    /// [n_layers, num_blocks, block_size, pe_q8_per_token]
+    k_pe_q8: ?[]dequant.BlockQ8_0,
+    /// 反量化临时缓冲区
+    kv_scratch: []f32,
+    pe_scratch: []f32,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, hp: HyperParams, max_seq_len: u32) !Self {
@@ -84,6 +96,11 @@ pub const KVCache = struct {
         var block_table: std.ArrayList(u32) = .empty;
         errdefer block_table.deinit(allocator);
 
+        const kv_scratch = try allocator.alloc(f32, kv_rank);
+        errdefer allocator.free(kv_scratch);
+        const pe_scratch = try allocator.alloc(f32, rope_dim);
+        errdefer allocator.free(pe_scratch);
+
         return .{
             .allocator = allocator,
             .hp = hp,
@@ -96,6 +113,11 @@ pub const KVCache = struct {
             .hash_map = hash_map,
             .block_table = block_table,
             .len = 0,
+            .quantized = false,
+            .kv_q8 = null,
+            .k_pe_q8 = null,
+            .kv_scratch = kv_scratch,
+            .pe_scratch = pe_scratch,
         };
     }
 
@@ -110,6 +132,25 @@ pub const KVCache = struct {
         self.allocator.free(self.blocks);
         self.free_list.deinit(self.allocator);
         self.hash_map.deinit();
+        if (self.kv_q8) |buf| self.allocator.free(buf);
+        if (self.k_pe_q8) |buf| self.allocator.free(buf);
+        self.allocator.free(self.kv_scratch);
+        self.allocator.free(self.pe_scratch);
+    }
+
+    /// 启用 Q8_0 KV Cache 量化（lazy，可随时调用）
+    pub fn enableQuantization(self: *Self) !void {
+        if (self.quantized) return;
+        const n_layers = self.hp.num_hidden_layers;
+        const kv_rank = self.hp.kv_lora_rank;
+        const rope_dim = self.hp.qk_rope_head_dim;
+        const kv_q8_per_token = (kv_rank + 31) / 32;
+        const pe_q8_per_token = (rope_dim + 31) / 32;
+        const total_tokens = n_layers * self.num_blocks * self.block_size;
+
+        self.kv_q8 = try self.allocator.alloc(dequant.BlockQ8_0, total_tokens * kv_q8_per_token);
+        self.k_pe_q8 = try self.allocator.alloc(dequant.BlockQ8_0, total_tokens * pe_q8_per_token);
+        self.quantized = true;
     }
 
     // ===== Block 管理 =====
@@ -181,22 +222,56 @@ pub const KVCache = struct {
         return self.block_table.items[block_idx];
     }
 
-    pub fn getKVCompressed(self: *const Self, layer: u32, pos: u32) ![]const f32 {
+    pub fn getKVCompressed(self: *Self, layer: u32, pos: u32) ![]const f32 {
         if (layer >= self.hp.num_hidden_layers) return error.LayerOutOfBounds;
         if (pos >= self.len) return error.PositionNotWritten;
         const block_id = try self.resolveBlock(pos);
         const offset = pos % self.block_size;
         const kv_rank = self.hp.kv_lora_rank;
+
+        if (self.quantized) {
+            const kv_q8_per_token = (kv_rank + 31) / 32;
+            const base_kv_q8 = ((layer * self.num_blocks + block_id) * self.block_size + offset) * kv_q8_per_token;
+            const blocks = self.kv_q8.?[base_kv_q8..][0..kv_q8_per_token];
+            for (0..kv_q8_per_token) |bi| {
+                const start = bi * 32;
+                const end = @min(start + 32, kv_rank);
+                const d = dequant.f16ToF32(blocks[bi].d);
+                for (start..end) |vi| {
+                    const qi = vi - start;
+                    self.kv_scratch[vi] = d * @as(f32, @floatFromInt(blocks[bi].qs[qi]));
+                }
+            }
+            return self.kv_scratch[0..kv_rank];
+        }
+
         const base = ((layer * self.num_blocks + block_id) * self.block_size + offset) * kv_rank;
         return self.kv_compressed[base..][0..kv_rank];
     }
 
-    pub fn getKPe(self: *const Self, layer: u32, pos: u32) ![]const f32 {
+    pub fn getKPe(self: *Self, layer: u32, pos: u32) ![]const f32 {
         if (layer >= self.hp.num_hidden_layers) return error.LayerOutOfBounds;
         if (pos >= self.len) return error.PositionNotWritten;
         const block_id = try self.resolveBlock(pos);
         const offset = pos % self.block_size;
         const rope_dim = self.hp.qk_rope_head_dim;
+
+        if (self.quantized) {
+            const pe_q8_per_token = (rope_dim + 31) / 32;
+            const base_pe_q8 = ((layer * self.num_blocks + block_id) * self.block_size + offset) * pe_q8_per_token;
+            const blocks = self.k_pe_q8.?[base_pe_q8..][0..pe_q8_per_token];
+            for (0..pe_q8_per_token) |bi| {
+                const start = bi * 32;
+                const end = @min(start + 32, rope_dim);
+                const d = dequant.f16ToF32(blocks[bi].d);
+                for (start..end) |vi| {
+                    const qi = vi - start;
+                    self.pe_scratch[vi] = d * @as(f32, @floatFromInt(blocks[bi].qs[qi]));
+                }
+            }
+            return self.pe_scratch[0..rope_dim];
+        }
+
         const base = ((layer * self.num_blocks + block_id) * self.block_size + offset) * rope_dim;
         return self.k_pe[base..][0..rope_dim];
     }
@@ -208,14 +283,65 @@ pub const KVCache = struct {
 
         const block_id = try self.resolveBlock(pos);
         const offset = pos % self.block_size;
-
         const kv_rank = self.hp.kv_lora_rank;
-        const base_kv = ((layer * self.num_blocks + block_id) * self.block_size + offset) * kv_rank;
-        @memcpy(self.kv_compressed[base_kv..][0..kv_rank], kv_comp);
-
         const rope_dim = self.hp.qk_rope_head_dim;
-        const base_pe = ((layer * self.num_blocks + block_id) * self.block_size + offset) * rope_dim;
-        @memcpy(self.k_pe[base_pe..][0..rope_dim], k_pe_val);
+
+        if (self.quantized) {
+            // 量化写入 Q8_0
+            const kv_q8_per_token = (kv_rank + 31) / 32;
+            const base_kv_q8 = ((layer * self.num_blocks + block_id) * self.block_size + offset) * kv_q8_per_token;
+            var kv_blocks = self.kv_q8.?[base_kv_q8..][0..kv_q8_per_token];
+            for (0..kv_q8_per_token) |bi| {
+                const start = bi * 32;
+                const end = @min(start + 32, kv_rank);
+                var max_abs: f32 = 0;
+                for (kv_comp[start..end]) |v| {
+                    const av = @abs(v);
+                    if (av > max_abs) max_abs = av;
+                }
+                const d = if (max_abs > 0) max_abs / 127.0 else 0.0;
+                kv_blocks[bi].d = dequant.f32ToF16(d);
+                for (start..end, 0..) |vi, qi| {
+                    var q_i = @as(i32, @intFromFloat(@round(kv_comp[vi] / d)));
+                    if (q_i > 127) q_i = 127;
+                    if (q_i < -127) q_i = -127;
+                    kv_blocks[bi].qs[qi] = @intCast(q_i);
+                }
+                for (end - start..32) |qi| {
+                    kv_blocks[bi].qs[qi] = 0;
+                }
+            }
+
+            const pe_q8_per_token = (rope_dim + 31) / 32;
+            const base_pe_q8 = ((layer * self.num_blocks + block_id) * self.block_size + offset) * pe_q8_per_token;
+            var pe_blocks = self.k_pe_q8.?[base_pe_q8..][0..pe_q8_per_token];
+            for (0..pe_q8_per_token) |bi| {
+                const start = bi * 32;
+                const end = @min(start + 32, rope_dim);
+                var max_abs: f32 = 0;
+                for (k_pe_val[start..end]) |v| {
+                    const av = @abs(v);
+                    if (av > max_abs) max_abs = av;
+                }
+                const d = if (max_abs > 0) max_abs / 127.0 else 0.0;
+                pe_blocks[bi].d = dequant.f32ToF16(d);
+                for (start..end, 0..) |vi, qi| {
+                    var q_i = @as(i32, @intFromFloat(@round(k_pe_val[vi] / d)));
+                    if (q_i > 127) q_i = 127;
+                    if (q_i < -127) q_i = -127;
+                    pe_blocks[bi].qs[qi] = @intCast(q_i);
+                }
+                for (end - start..32) |qi| {
+                    pe_blocks[bi].qs[qi] = 0;
+                }
+            }
+        } else {
+            const base_kv = ((layer * self.num_blocks + block_id) * self.block_size + offset) * kv_rank;
+            @memcpy(self.kv_compressed[base_kv..][0..kv_rank], kv_comp);
+
+            const base_pe = ((layer * self.num_blocks + block_id) * self.block_size + offset) * rope_dim;
+            @memcpy(self.k_pe[base_pe..][0..rope_dim], k_pe_val);
+        }
 
         if (pos >= self.len) {
             self.len = pos + 1;
