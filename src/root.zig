@@ -172,11 +172,11 @@ pub const Session = struct {
             self.processed_len = 0;
         }
 
-        // 3. 处理未缓存的 token
+        // 3. 处理未缓存的 token（使用批量 forward）
         const start = self.processed_len;
-        for (start..new_tokens.len) |i| {
-            const pos: u32 = @intCast(i);
-            _ = try self.engine.forward(new_tokens[i], pos);
+        if (start < new_tokens.len) {
+            const batch = new_tokens[start..];
+            _ = try self.engine.forwardBatch(batch, @intCast(start));
         }
 
         // 4. 如果全部命中缓存但没有 forward 任何 token，需要 forward 最后一个 token 获得 logits

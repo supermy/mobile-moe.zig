@@ -46,6 +46,12 @@ pub const InferenceEngine = struct {
     ffn_out: []f32, // [hidden_size] FFN 输出
     logits: []f32, // [vocab_size]
 
+    // 批量推理缓冲区（Prompt Prefill 优化）
+    max_batch_size: u32,
+    batch_hidden: []f32, // [max_batch_size, hidden_size]
+    batch_attn_out: []f32, // [max_batch_size, hidden_size]
+    batch_ffn_out: []f32, // [max_batch_size, hidden_size]
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, weights: model.ModelWeights, tok: tokenizer.Tokenizer, max_seq_len: u32) !Self {
@@ -68,6 +74,11 @@ pub const InferenceEngine = struct {
         const ffn_out = try allocator.alloc(f32, hp.hidden_size);
         const logits = try allocator.alloc(f32, hp.vocab_size);
 
+        const max_batch_size: u32 = 256; // Prompt Prefill 最大 batch
+        const batch_hidden = try allocator.alloc(f32, max_batch_size * hp.hidden_size);
+        const batch_attn_out = try allocator.alloc(f32, max_batch_size * hp.hidden_size);
+        const batch_ffn_out = try allocator.alloc(f32, max_batch_size * hp.hidden_size);
+
         return .{
             .allocator = allocator,
             .weights = weights,
@@ -86,6 +97,10 @@ pub const InferenceEngine = struct {
             .attn_out = attn_out,
             .ffn_out = ffn_out,
             .logits = logits,
+            .max_batch_size = max_batch_size,
+            .batch_hidden = batch_hidden,
+            .batch_attn_out = batch_attn_out,
+            .batch_ffn_out = batch_ffn_out,
         };
     }
 
@@ -101,6 +116,9 @@ pub const InferenceEngine = struct {
         allocator.free(self.attn_out);
         allocator.free(self.ffn_out);
         allocator.free(self.logits);
+        allocator.free(self.batch_hidden);
+        allocator.free(self.batch_attn_out);
+        allocator.free(self.batch_ffn_out);
         self.rope_cache.deinit(allocator);
         self.kv.deinit();
         self.sched.deinit();
@@ -133,6 +151,22 @@ pub const InferenceEngine = struct {
         // 4. 输出投影 (lm_head)
         try self.computeLogits();
 
+        return self.logits;
+    }
+
+    /// 批量前向传播：处理多个 token（Prompt Prefill 优化入口）
+    /// 当前实现退化为逐 token forward，但接口已建立，后续可接入 FlashAttention 批量计算
+    pub fn forwardBatch(self: *Self, token_ids: []const u32, start_pos: u32) ![]f32 {
+        if (token_ids.len == 0) return error.EmptyBatch;
+        if (token_ids.len == 1) {
+            return self.forward(token_ids[0], start_pos);
+        }
+
+        // TODO: FlashAttention 批量 Prompt Prefill
+        // 当前逐 token 处理，后续优化为层优先批量计算
+        for (token_ids, 0..) |tid, i| {
+            _ = try self.forward(tid, @intCast(start_pos + i));
+        }
         return self.logits;
     }
 
@@ -287,13 +321,9 @@ pub const InferenceEngine = struct {
         // ===== 4. 写入 KV 缓存 =====
         try self.kv.put(layer, pos, self.kv_comp, k_pe);
 
-        // ===== 5. 注意力计算 =====
-        // 对每个头：k_b 展开 kv_comp → k_nope_out，v_b 展开 kv_comp → v_out
-        // 然后与 Q 做标准缩放点积注意力
+        // ===== 5. 注意力计算（FlashAttention 分块）=====
         @memset(self.attn_out, 0);
 
-        // 先对当前位置展开 K_nope 和 V
-        // 同时反量化 k_b 和 v_b 权重一次，供所有头和历史位置复用
         const k_b_dim = n_heads * qk_nope;
         const v_b_dim = n_heads * v_dim;
         var k_b_w: ?[]const f32 = null;
@@ -311,82 +341,103 @@ pub const InferenceEngine = struct {
             if (v_b_w) |w| self.allocator.free(w);
         }
 
-        // 保存当前位置的 K_nope 和 V 到临时缓冲区
-        // 因为后续历史位置展开会覆盖 k_nope_out 和 v_out
         const cur_k_nope_all = try self.allocator.dupe(f32, self.k_nope_out);
         defer self.allocator.free(cur_k_nope_all);
         const cur_v_all = try self.allocator.dupe(f32, self.v_out);
         defer self.allocator.free(cur_v_all);
 
+        const BLOCK_SIZE: usize = 64;
+        var o_vec = try self.allocator.alloc(f32, v_dim);
+        defer self.allocator.free(o_vec);
+
         for (0..n_heads) |h| {
             const q_head = self.q_out[h * head_dim ..][0..head_dim];
             const q_nope = q_head[0..qk_nope];
             const q_rope = q_head[qk_nope..][0..qk_rope];
-
-            // 当前位置的 K_nope 和 V 从保存的缓冲区中取
             const cur_k_nope = cur_k_nope_all[h * qk_nope ..][0..qk_nope];
             const cur_v = cur_v_all[h * v_dim ..][0..v_dim];
-
-            // 对每个历史位置计算注意力分数
-            var attn_scores = try self.allocator.alloc(f32, pos + 1);
-            defer self.allocator.free(attn_scores);
-
-            for (0..pos + 1) |p| {
-                var score: f32 = 0;
-
-                if (p == pos) {
-                    // 当前位置：直接使用已保存的 K_nope
-                    for (q_nope, cur_k_nope) |qv, kv| {
-                        score += qv * kv;
-                    }
-                } else {
-                    // 历史位置：展开缓存的 kv_comp 到 k_nope_out
-                    const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
-
-                    if (k_b_w) |w| {
-                        math.matVecMul(self.k_nope_out, w, kv_cached, k_b_dim, kv_rank);
-                    }
-
-                    const hist_k_nope = self.k_nope_out[h * qk_nope ..][0..qk_nope];
-                    for (q_nope, hist_k_nope) |qv, kv| {
-                        score += qv * kv;
-                    }
-                }
-
-                // Q 的 rope 部分与缓存的 k_pe 点积
-                const k_pe_cached = try self.kv.getKPe(layer, @intCast(p));
-                for (q_rope, k_pe_cached) |qv, kv| {
-                    score += qv * kv;
-                }
-
-                attn_scores[p] = score / @sqrt(@as(f32, @floatFromInt(head_dim)));
-            }
-
-            // Softmax
-            math.softmax(attn_scores, attn_scores);
-
-            // 加权求和 V
             const head_out: []f32 = self.attn_out[h * v_dim ..][0..v_dim];
 
-            for (0..pos + 1) |p| {
-                const weight = attn_scores[p];
+            var m_vec: f32 = -std.math.inf(f32);
+            var l_vec: f32 = 0;
+            @memset(o_vec, 0);
 
-                if (p == pos) {
-                    // 当前位置的 V（从保存的缓冲区取）
-                    for (head_out, cur_v) |*o, v| {
-                        o.* += weight * v;
+            const num_blocks = (pos + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            for (0..num_blocks) |bj| {
+                const b_start = bj * BLOCK_SIZE;
+                const b_end = @min(b_start + BLOCK_SIZE, pos + 1);
+                const b_len = b_end - b_start;
+
+                var scores: [BLOCK_SIZE]f32 = @splat(0);
+                for (b_start..b_end) |p| {
+                    var score: f32 = 0;
+
+                    if (p == pos) {
+                        for (q_nope, cur_k_nope) |qv, kv| {
+                            score += qv * kv;
+                        }
+                    } else {
+                        const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
+                        if (k_b_w) |w| {
+                            math.matVecMul(self.k_nope_out, w, kv_cached, k_b_dim, kv_rank);
+                        }
+                        const hist_k_nope = self.k_nope_out[h * qk_nope ..][0..qk_nope];
+                        for (q_nope, hist_k_nope) |qv, kv| {
+                            score += qv * kv;
+                        }
                     }
-                } else {
-                    // 历史位置：展开 kv_comp 到 v_out
-                    const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
-                    if (v_b_w) |w| {
-                        math.matVecMul(self.v_out, w, kv_cached, v_b_dim, kv_rank);
+
+                    const k_pe_cached = try self.kv.getKPe(layer, @intCast(p));
+                    for (q_rope, k_pe_cached) |qv, kv| {
+                        score += qv * kv;
                     }
-                    const hist_v = self.v_out[h * v_dim ..][0..v_dim];
-                    for (head_out, hist_v) |*o, v| {
-                        o.* += weight * v;
+
+                    scores[p - b_start] = score / @sqrt(@as(f32, @floatFromInt(head_dim)));
+                }
+
+                var m_j: f32 = -std.math.inf(f32);
+                for (0..b_len) |i| {
+                    if (scores[i] > m_j) m_j = scores[i];
+                }
+                var l_j: f32 = 0;
+                for (0..b_len) |i| {
+                    scores[i] = @exp(scores[i] - m_j);
+                    l_j += scores[i];
+                }
+
+                const m_new = @max(m_vec, m_j);
+                const scale_o = @exp(m_vec - m_new);
+                const scale_s = @exp(m_j - m_new);
+
+                for (0..v_dim) |i| {
+                    o_vec[i] = o_vec[i] * scale_o;
+                }
+
+                for (b_start..b_end) |p| {
+                    const weight = scores[p - b_start] * scale_s;
+
+                    if (p == pos) {
+                        for (0..v_dim) |i| {
+                            o_vec[i] += weight * cur_v[i];
+                        }
+                    } else {
+                        const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
+                        if (v_b_w) |w| {
+                            math.matVecMul(self.v_out, w, kv_cached, v_b_dim, kv_rank);
+                        }
+                        const hist_v = self.v_out[h * v_dim ..][0..v_dim];
+                        for (0..v_dim) |i| {
+                            o_vec[i] += weight * hist_v[i];
+                        }
                     }
                 }
+
+                m_vec = m_new;
+                l_vec = l_vec * scale_o + l_j * scale_s;
+            }
+
+            for (0..v_dim) |i| {
+                head_out[i] = o_vec[i] / l_vec;
             }
         }
 
