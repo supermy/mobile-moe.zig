@@ -22,13 +22,26 @@ web增加readme.md的访问入口，方便用户快速上手。
   - SIMD 向量化 MatMul / dot / rmsNorm（4-wide f32）
   - Engine.generateText() 文本生成 API
 - [x] 中期优化（已落地）：
-  - Continuous Batching 接口设计（RequestQueue + /v1/completions/batch）
-  - Server 占位框架（兼容 Zig 0.16.0 std.Io 演进）
+  - FlashAttention 分块计算（BLOCK_SIZE=64, online softmax）
+  - Prompt Prefill 批量 forward 接口（`InferenceEngine.forwardBatch`）
+  - std.Io 异步 HTTP 服务框架（`std.Io.Threaded` + `std.Io.net.Server`）
+  - 支持 `/v1/chat/completions` 和 `/health`
+  - Continuous Batching 接口设计（RequestQueue + `/v1/completions/batch`）
 - [x] 长期优化（已落地）：
+  - 量化矩阵乘法 QMM（`qmm.zig`: `matVecMulQ8_0` SIMD）
   - KV Cache Q8_0 量化接口（`enableQuantization()` + 读写支持）
   - GPU 后端设计文档（Metal / OpenCL / Vulkan 架构）
 - [x] 生产部署：ReleaseFast 编译通过（CLI 592K / Server 439K）
 - [x] 本地 Git 仓库初始化并提交（待同步到 GitHub）
+- [x] Prompt Prefill 层优先优化：`forwardBatch` 内部改为"层优先"，每层权重只反量化一次
+- [x] QMM 集成到 InferenceEngine：`q_a_proj` / `kv_a_proj` 等权重保持 Q8_0 格式，直接调用 `matVecMulQ8_0`
+- [x] Expert 并行：使用 `std.Thread` 并行执行 Top-K 专家 FFN
+- [x] Metal 内核：实现 `matVecMul.metal` 和 `rmsNorm.metal`
+- [x] 推理测试：输入"中国的首都是"并获取模型输出
+- [x] 手机硬件检测：`scripts/detect_android.sh` 检测 CPU/GPU/NPU 信息
+- [x] CPU 实测：`scripts/bench_cpu.zig` 实测 2.38 GFLOPS
+- [x] GPU/NPU 实测：OpenCL 直接测试因驱动兼容性失败，已切换 APK 方案（AI Benchmark）
+- [x] 新增 benchmark 脚本：`scripts/bench_all.sh` 总控脚本，`scripts/run_aibench.sh` APK 方案
 
 ## 待办
 - [ ] CI/CD 配置：使用 GitHub Actions 实现多平台自动构建、测试和部署

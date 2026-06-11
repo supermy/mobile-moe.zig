@@ -50,17 +50,19 @@ pub const Tokenizer = struct {
             pos += len;
         }
 
-        // 读取 scores
-        const scores_meta = gguf.metadata.get("tokenizer.ggml.scores") orelse return error.MissingScores;
+        // 读取 scores（可选：部分模型如 GLM-4.7-Flash 不含此字段）
         const scores = try allocator.alloc(f32, n_tokens);
         errdefer allocator.free(scores);
+        @memset(scores, 0);
 
-        if (scores_meta == .array and scores_meta.array.elem_type == .float32) {
-            const score_bytes = scores_meta.array.data;
-            for (0..n_tokens) |i| {
-                const offset = i * 4;
-                if (offset + 4 > score_bytes.len) return error.InvalidScoreData;
-                scores[i] = @bitCast(std.mem.readInt(u32, score_bytes[offset..][0..4], .little));
+        if (gguf.metadata.get("tokenizer.ggml.scores")) |scores_meta| {
+            if (scores_meta == .array and scores_meta.array.elem_type == .float32) {
+                const score_bytes = scores_meta.array.data;
+                for (0..n_tokens) |i| {
+                    const offset = i * 4;
+                    if (offset + 4 > score_bytes.len) return error.InvalidScoreData;
+                    scores[i] = @bitCast(std.mem.readInt(u32, score_bytes[offset..][0..4], .little));
+                }
             }
         }
 

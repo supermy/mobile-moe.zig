@@ -58,6 +58,8 @@ pub const ExpertStats = struct {
 
     /// 线性时间选择：找到降序第 k 大的值（k >= 1）
     fn quickSelectThreshold(layer_counts: []const u64, k: usize) u64 {
+        if (layer_counts.len == 0 or k == 0) return 0;
+
         // 小数组优化：直接复制到栈上排序
         if (layer_counts.len <= 256) {
             var buf: [256]u64 = undefined;

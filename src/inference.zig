@@ -18,6 +18,7 @@
 const std = @import("std");
 const math = @import("math.zig");
 const dequant = @import("dequant.zig");
+const qmm = @import("qmm.zig");
 const model = @import("model.zig");
 const GgmlType = @import("gguf.zig").GgmlType;
 const tokenizer = @import("tokenizer.zig");
@@ -51,6 +52,11 @@ pub const InferenceEngine = struct {
     batch_hidden: []f32, // [max_batch_size, hidden_size]
     batch_attn_out: []f32, // [max_batch_size, hidden_size]
     batch_ffn_out: []f32, // [max_batch_size, hidden_size]
+
+    // 层权重缓存（Prompt Prefill 层优先优化）
+    cached_layer: u32,
+    cached_k_b_w: ?[]f32,
+    cached_v_b_w: ?[]f32,
 
     const Self = @This();
 
@@ -101,6 +107,9 @@ pub const InferenceEngine = struct {
             .batch_hidden = batch_hidden,
             .batch_attn_out = batch_attn_out,
             .batch_ffn_out = batch_ffn_out,
+            .cached_layer = std.math.maxInt(u32),
+            .cached_k_b_w = null,
+            .cached_v_b_w = null,
         };
     }
 
@@ -119,6 +128,8 @@ pub const InferenceEngine = struct {
         allocator.free(self.batch_hidden);
         allocator.free(self.batch_attn_out);
         allocator.free(self.batch_ffn_out);
+        if (self.cached_k_b_w) |w| allocator.free(w);
+        if (self.cached_v_b_w) |w| allocator.free(w);
         self.rope_cache.deinit(allocator);
         self.kv.deinit();
         self.sched.deinit();
@@ -154,19 +165,46 @@ pub const InferenceEngine = struct {
         return self.logits;
     }
 
-    /// 批量前向传播：处理多个 token（Prompt Prefill 优化入口）
-    /// 当前实现退化为逐 token forward，但接口已建立，后续可接入 FlashAttention 批量计算
+    /// 批量前向传播：处理多个 token（Prompt Prefill 层优先优化）
+    /// 层优先：逐层处理所有 token，每层权重（k_b/v_b）只反量化一次
     pub fn forwardBatch(self: *Self, token_ids: []const u32, start_pos: u32) ![]f32 {
         if (token_ids.len == 0) return error.EmptyBatch;
+        if (token_ids.len > self.max_batch_size) return error.BatchTooLarge;
         if (token_ids.len == 1) {
             return self.forward(token_ids[0], start_pos);
         }
 
-        // TODO: FlashAttention 批量 Prompt Prefill
-        // 当前逐 token 处理，后续优化为层优先批量计算
+        const hp = self.weights.hp;
+
+        // 1. Embedding 查找所有 token 到 batch_hidden
         for (token_ids, 0..) |tid, i| {
-            _ = try self.forward(tid, @intCast(start_pos + i));
+            try self.embedToken(tid);
+            @memcpy(self.batch_hidden[i * hp.hidden_size ..][0..hp.hidden_size], self.hidden);
         }
+
+        // 2. 层优先：外层循环 layer，内层循环 token
+        // 这样 cached_layer 在同一层处理多个 token 期间保持不变，
+        // k_b / v_b 权重每层只反量化一次
+        for (0..hp.num_hidden_layers) |layer| {
+            for (0..token_ids.len) |bi| {
+                const pos = start_pos + @as(u32, @intCast(bi));
+                @memcpy(self.hidden, self.batch_hidden[bi * hp.hidden_size ..][0..hp.hidden_size]);
+                try self.forwardLayer(@intCast(layer), pos);
+                @memcpy(self.batch_hidden[bi * hp.hidden_size ..][0..hp.hidden_size], self.hidden);
+            }
+        }
+
+        // 3. 输出 RMSNorm（仅最后一个 token）
+        @memcpy(self.hidden, self.batch_hidden[(token_ids.len - 1) * hp.hidden_size ..][0..hp.hidden_size]);
+        if (self.weights.output_norm) |norm_ptr| {
+            const norm = try dequant.dequantize(self.allocator, norm_ptr, self.weights.output_norm_type, hp.hidden_size);
+            defer self.allocator.free(norm);
+            math.rmsNorm(self.hidden, self.hidden, norm, hp.rms_norm_eps);
+        }
+
+        // 4. 输出投影 (lm_head)
+        try self.computeLogits();
+
         return self.logits;
     }
 
@@ -265,9 +303,7 @@ pub const InferenceEngine = struct {
 
         // ===== 1. Q 压缩投影: hidden[hidden_size] → q_comp[q_lora_rank] =====
         if (lw.q_a_proj) |w_ptr| {
-            const w = try dequant.dequantize(self.allocator, w_ptr, lw.q_a_proj_type, hp.q_lora_rank * hp.hidden_size);
-            defer self.allocator.free(w);
-            math.matVecMul(self.q_comp, w, self.hidden, hp.q_lora_rank, hp.hidden_size);
+            try self.matVecMulUnified(self.q_comp, w_ptr, lw.q_a_proj_type, self.hidden, hp.q_lora_rank, hp.hidden_size);
         }
 
         // Q RMSNorm
@@ -279,9 +315,7 @@ pub const InferenceEngine = struct {
 
         // Q 展开投影: q_comp[q_lora_rank] → q_out[num_heads * head_dim]
         if (lw.q_b_proj) |w_ptr| {
-            const w = try dequant.dequantize(self.allocator, w_ptr, lw.q_b_proj_type, n_heads * head_dim * hp.q_lora_rank);
-            defer self.allocator.free(w);
-            math.matVecMul(self.q_out, w, self.q_comp, n_heads * head_dim, hp.q_lora_rank);
+            try self.matVecMulUnified(self.q_out, w_ptr, lw.q_b_proj_type, self.q_comp, n_heads * head_dim, hp.q_lora_rank);
         }
 
         // ===== 2. KV 压缩投影: hidden[hidden_size] → kv_a_out[kv_lora_rank + qk_rope_head_dim] =====
@@ -289,9 +323,7 @@ pub const InferenceEngine = struct {
         // 前 kv_lora_rank 维为压缩 KV，后 qk_rope_head_dim 维为 k_pe
         const kv_a_dim = kv_rank + qk_rope;
         if (lw.kv_a_proj) |w_ptr| {
-            const w = try dequant.dequantize(self.allocator, w_ptr, lw.kv_a_proj_type, kv_a_dim * hp.hidden_size);
-            defer self.allocator.free(w);
-            math.matVecMul(self.kv_a_out, w, self.hidden, kv_a_dim, hp.hidden_size);
+            try self.matVecMulUnified(self.kv_a_out, w_ptr, lw.kv_a_proj_type, self.hidden, kv_a_dim, hp.hidden_size);
         }
 
         // 分离 kv_comp 和 k_pe
@@ -326,19 +358,27 @@ pub const InferenceEngine = struct {
 
         const k_b_dim = n_heads * qk_nope;
         const v_b_dim = n_heads * v_dim;
-        var k_b_w: ?[]const f32 = null;
-        var v_b_w: ?[]const f32 = null;
-        if (lw.k_b) |w_ptr| {
-            k_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.k_b_type, k_b_dim * kv_rank);
-            math.matVecMul(self.k_nope_out, k_b_w.?, self.kv_comp, k_b_dim, kv_rank);
+        // 层权重缓存：k_b / v_b 每层只反量化一次
+        if (self.cached_layer != layer or self.cached_k_b_w == null) {
+            if (self.cached_k_b_w) |w| self.allocator.free(w);
+            if (self.cached_v_b_w) |w| self.allocator.free(w);
+            self.cached_k_b_w = null;
+            self.cached_v_b_w = null;
+
+            if (lw.k_b) |w_ptr| {
+                self.cached_k_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.k_b_type, k_b_dim * kv_rank);
+            }
+            if (lw.v_b) |w_ptr| {
+                self.cached_v_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.v_b_type, v_b_dim * kv_rank);
+            }
+            self.cached_layer = layer;
         }
-        if (lw.v_b) |w_ptr| {
-            v_b_w = try dequant.dequantize(self.allocator, w_ptr, lw.v_b_type, v_b_dim * kv_rank);
-            math.matVecMul(self.v_out, v_b_w.?, self.kv_comp, v_b_dim, kv_rank);
+
+        if (self.cached_k_b_w) |w| {
+            math.matVecMul(self.k_nope_out, w, self.kv_comp, k_b_dim, kv_rank);
         }
-        defer {
-            if (k_b_w) |w| self.allocator.free(w);
-            if (v_b_w) |w| self.allocator.free(w);
+        if (self.cached_v_b_w) |w| {
+            math.matVecMul(self.v_out, w, self.kv_comp, v_b_dim, kv_rank);
         }
 
         const cur_k_nope_all = try self.allocator.dupe(f32, self.k_nope_out);
@@ -378,7 +418,7 @@ pub const InferenceEngine = struct {
                         }
                     } else {
                         const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
-                        if (k_b_w) |w| {
+                        if (self.cached_k_b_w) |w| {
                             math.matVecMul(self.k_nope_out, w, kv_cached, k_b_dim, kv_rank);
                         }
                         const hist_k_nope = self.k_nope_out[h * qk_nope ..][0..qk_nope];
@@ -422,7 +462,7 @@ pub const InferenceEngine = struct {
                         }
                     } else {
                         const kv_cached = try self.kv.getKVCompressed(layer, @intCast(p));
-                        if (v_b_w) |w| {
+                        if (self.cached_v_b_w) |w| {
                             math.matVecMul(self.v_out, w, kv_cached, v_b_dim, kv_rank);
                         }
                         const hist_v = self.v_out[h * v_dim ..][0..v_dim];
@@ -443,9 +483,7 @@ pub const InferenceEngine = struct {
 
         // ===== 6. 输出投影: attn_out[num_heads * v_head_dim] → hidden[hidden_size] =====
         if (lw.o_proj) |w_ptr| {
-            const w = try dequant.dequantize(self.allocator, w_ptr, lw.o_proj_type, hp.hidden_size * n_heads * v_dim);
-            defer self.allocator.free(w);
-            math.matVecMul(self.hidden, w, self.attn_out, hp.hidden_size, n_heads * v_dim);
+            try self.matVecMulUnified(self.hidden, w_ptr, lw.o_proj_type, self.attn_out, hp.hidden_size, n_heads * v_dim);
         }
     }
 
@@ -464,14 +502,10 @@ pub const InferenceEngine = struct {
         if (lw.moe_gate == null) {
             return error.MissingMoEGateWeights;
         }
-        const gate_ptr = lw.moe_gate.?;
-        const gate_w = try dequant.dequantize(self.allocator, gate_ptr, lw.moe_gate_type, hp.n_routed_experts * hp.hidden_size);
-        defer self.allocator.free(gate_w);
-
         const gate_scores = try self.allocator.alloc(f32, hp.n_routed_experts);
         defer self.allocator.free(gate_scores);
 
-        math.matVecMul(gate_scores, gate_w, self.hidden, hp.n_routed_experts, hp.hidden_size);
+        try self.matVecMulUnified(gate_scores, lw.moe_gate.?, lw.moe_gate_type, self.hidden, hp.n_routed_experts, hp.hidden_size);
 
         // 路由调度
         const route = try self.sched.route(layer, gate_scores);
@@ -484,20 +518,84 @@ pub const InferenceEngine = struct {
         // 初始化 FFN 输出
         @memset(self.ffn_out, 0);
 
-        // 执行路由专家
-        for (route.expert_ids, 0..) |eid, i| {
-            switch (route.targets[i]) {
-                .skipped => continue,
-                .gpu, .cpu => {
-                    const expert_out = try self.expertFFN(layer, eid);
-                    defer self.allocator.free(expert_out);
+        // 执行路由专家（并行）
+        var active_count: usize = 0;
+        for (route.targets) |t| {
+            if (t != .skipped) active_count += 1;
+        }
 
-                    // 加权累加
-                    const w = route.weights[i];
-                    for (self.ffn_out, expert_out) |*f, e| {
-                        f.* += w * e;
-                    }
-                },
+        if (active_count > 0) {
+            const expert_outputs = try self.allocator.alloc([]f32, active_count);
+            defer {
+                for (expert_outputs) |out| self.allocator.free(out);
+                self.allocator.free(expert_outputs);
+            }
+
+            for (0..active_count) |i| {
+                expert_outputs[i] = try self.allocator.alloc(f32, hp.hidden_size);
+                @memset(expert_outputs[i], 0);
+            }
+
+            const ExpertCtx = struct {
+                engine: *Self,
+                layer: u32,
+                eid: u32,
+                out: []f32,
+            };
+
+            const worker = struct {
+                fn run(ctx: ExpertCtx) void {
+                    const result = ctx.engine.expertFFN(ctx.layer, ctx.eid) catch {
+                        @memset(ctx.out, 0);
+                        return;
+                    };
+                    defer ctx.engine.allocator.free(result);
+                    @memcpy(ctx.out, result);
+                }
+            }.run;
+
+            // 防御性断言：Top-K 最多 4 个专家，固定线程数组足够
+            std.debug.assert(active_count <= 4);
+
+            var threads: [4]std.Thread = undefined;
+            var thread_idx: usize = 0;
+            var out_idx: usize = 0;
+
+            errdefer {
+                // spawn 失败时，join 已启动的线程避免泄漏
+                for (0..thread_idx) |ti| {
+                    threads[ti].join();
+                }
+            }
+
+            for (route.expert_ids, route.targets) |eid, target| {
+                if (target == .skipped) continue;
+
+                const ctx = ExpertCtx{
+                    .engine = self,
+                    .layer = layer,
+                    .eid = eid,
+                    .out = expert_outputs[out_idx],
+                };
+                out_idx += 1;
+
+                threads[thread_idx] = try std.Thread.spawn(.{}, worker, .{ctx});
+                thread_idx += 1;
+            }
+
+            for (0..thread_idx) |ti| {
+                threads[ti].join();
+            }
+
+            // 加权累加
+            out_idx = 0;
+            for (route.expert_ids, route.targets, 0..) |_, target, i| {
+                if (target == .skipped) continue;
+                const w = route.weights[i];
+                for (self.ffn_out, expert_outputs[out_idx]) |*f, e| {
+                    f.* += w * e;
+                }
+                out_idx += 1;
             }
         }
 
@@ -537,32 +635,26 @@ pub const InferenceEngine = struct {
         const intermediate = hp.intermediate_size;
         const hidden = hp.hidden_size;
 
-        // Gate 投影
-        const gate_w = try dequant.dequantize(self.allocator, lw.dense_gate.?, lw.dense_type, intermediate * hidden);
-        defer self.allocator.free(gate_w);
+        // Gate 投影（QMM 直通）
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(gate_out);
+        try self.matVecMulUnified(gate_out, lw.dense_gate.?, lw.dense_type, self.hidden, intermediate, hidden);
 
-        // Up 投影
-        const up_w = try dequant.dequantize(self.allocator, lw.dense_up.?, lw.dense_type, intermediate * hidden);
-        defer self.allocator.free(up_w);
+        // Up 投影（QMM 直通）
         const up_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(up_out);
+        try self.matVecMulUnified(up_out, lw.dense_up.?, lw.dense_type, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
         math.mul(up_out, gate_out, up_out);
-        self.allocator.free(gate_out);
 
-        // Down 投影
-        const down_w = try dequant.dequantize(self.allocator, lw.dense_down.?, lw.dense_type, hidden * intermediate);
-        defer self.allocator.free(down_w);
+        // Down 投影（QMM 直通）
         const result = try self.allocator.alloc(f32, hidden);
-        math.matVecMul(result, down_w, up_out, hidden, intermediate);
-        self.allocator.free(up_out);
+        defer self.allocator.free(result);
+        try self.matVecMulUnified(result, lw.dense_down.?, lw.dense_type, up_out, hidden, intermediate);
 
         @memcpy(self.hidden, result);
-        self.allocator.free(result);
     }
 
     /// 共享专家 FFN: SiLU(gate) * up → down
@@ -573,29 +665,24 @@ pub const InferenceEngine = struct {
         const intermediate = hp.intermediate_size;
         const hidden = hp.hidden_size;
 
-        // Gate 投影
-        const gate_w = try dequant.dequantize(self.allocator, lw.shared_gate.?, lw.shared_type, intermediate * hidden);
-        defer self.allocator.free(gate_w);
+        // Gate 投影（QMM 直通）
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(gate_out);
+        try self.matVecMulUnified(gate_out, lw.shared_gate.?, lw.shared_type, self.hidden, intermediate, hidden);
 
-        // Up 投影
-        const up_w = try dequant.dequantize(self.allocator, lw.shared_up.?, lw.shared_type, intermediate * hidden);
-        defer self.allocator.free(up_w);
+        // Up 投影（QMM 直通）
         const up_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(up_out);
+        try self.matVecMulUnified(up_out, lw.shared_up.?, lw.shared_type, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
         math.mul(up_out, gate_out, up_out);
-        self.allocator.free(gate_out);
 
-        // Down 投影
-        const down_w = try dequant.dequantize(self.allocator, lw.shared_down.?, lw.shared_type, hidden * intermediate);
-        defer self.allocator.free(down_w);
+        // Down 投影（QMM 直通）
         const result = try self.allocator.alloc(f32, hidden);
-        math.matVecMul(result, down_w, up_out, hidden, intermediate);
-        self.allocator.free(up_out);
+        errdefer self.allocator.free(result);
+        try self.matVecMulUnified(result, lw.shared_down.?, lw.shared_type, up_out, hidden, intermediate);
 
         return result;
     }
@@ -613,38 +700,31 @@ pub const InferenceEngine = struct {
         const ggml_type = lw.expert_type;
 
         // 计算每个专家的权重块字节大小
-        // gate/up: [intermediate, hidden] per expert
-        // down: [hidden, intermediate] per expert
         const gate_up_bytes = ggml_type.tensorBytes(intermediate * hidden);
         const down_bytes = ggml_type.tensorBytes(hidden * intermediate);
 
         const gate_offset = expert_id * gate_up_bytes;
-        const up_offset = expert_id * gate_up_bytes; // up 张量独立存储，每专家偏移相同
+        const up_offset = expert_id * gate_up_bytes;
         const down_offset = expert_id * down_bytes;
 
-        // Gate 投影
-        const gate_w = try dequant.dequantize(self.allocator, lw.expert_gate.? + gate_offset, ggml_type, intermediate * hidden);
-        defer self.allocator.free(gate_w);
+        // Gate 投影（QMM 直通）
         const gate_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(gate_out, gate_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(gate_out);
+        try self.matVecMulUnified(gate_out, lw.expert_gate.? + gate_offset, ggml_type, self.hidden, intermediate, hidden);
 
-        // Up 投影
-        const up_w = try dequant.dequantize(self.allocator, lw.expert_up.? + up_offset, ggml_type, intermediate * hidden);
-        defer self.allocator.free(up_w);
+        // Up 投影（QMM 直通）
         const up_out = try self.allocator.alloc(f32, intermediate);
-        math.matVecMul(up_out, up_w, self.hidden, intermediate, hidden);
+        defer self.allocator.free(up_out);
+        try self.matVecMulUnified(up_out, lw.expert_up.? + up_offset, ggml_type, self.hidden, intermediate, hidden);
 
         // SiLU(gate) * up
         math.siluInplace(gate_out);
         math.mul(up_out, gate_out, up_out);
-        self.allocator.free(gate_out);
 
-        // Down 投影
-        const down_w = try dequant.dequantize(self.allocator, lw.expert_down.? + down_offset, ggml_type, hidden * intermediate);
-        defer self.allocator.free(down_w);
+        // Down 投影（QMM 直通）
         const result = try self.allocator.alloc(f32, hidden);
-        math.matVecMul(result, down_w, up_out, hidden, intermediate);
-        self.allocator.free(up_out);
+        errdefer self.allocator.free(result);
+        try self.matVecMulUnified(result, lw.expert_down.? + down_offset, ggml_type, up_out, hidden, intermediate);
 
         return result;
     }
@@ -655,9 +735,26 @@ pub const InferenceEngine = struct {
         if (self.weights.output_proj == null) {
             return error.MissingOutputProjection;
         }
-        const w = try dequant.dequantize(self.allocator, self.weights.output_proj.?, self.weights.output_proj_type, hp.vocab_size * hp.hidden_size);
-        defer self.allocator.free(w);
-        math.matVecMul(self.logits, w, self.hidden, hp.vocab_size, hp.hidden_size);
+        try self.matVecMulUnified(self.logits, self.weights.output_proj.?, self.weights.output_proj_type, self.hidden, hp.vocab_size, hp.hidden_size);
+    }
+
+    /// 统一矩阵-向量乘法：根据权重类型自动选择 QMM 或 f32 GEMM
+    fn matVecMulUnified(self: *Self, out: []f32, ptr: [*]const u8, type_: GgmlType, x: []const f32, out_dim: usize, in_dim: usize) !void {
+        switch (type_) {
+            .q8_0 => {
+                const block_size: usize = 32;
+                const blocks_per_row = (in_dim + block_size - 1) / block_size;
+                const n_blocks = out_dim * blocks_per_row;
+                const bytes = ptr[0..n_blocks * @sizeOf(dequant.BlockQ8_0)];
+                const blocks: []const dequant.BlockQ8_0 = @alignCast(@ptrCast(bytes));
+                qmm.matVecMulQ8_0(out, blocks, x, out_dim, in_dim);
+            },
+            else => {
+                const w = try dequant.dequantize(self.allocator, ptr, type_, out_dim * in_dim);
+                defer self.allocator.free(w);
+                math.matVecMul(out, w, x, out_dim, in_dim);
+            },
+        }
     }
 
     /// 热节流检查

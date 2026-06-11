@@ -385,6 +385,53 @@ pub fn dequantizeQ8_0(allocator: std.mem.Allocator, data: [*]const u8, n_element
     return out[0..n_elements];
 }
 
+// ========== Q5_K ==========
+pub const BlockQ5_K = extern struct {
+    d: u16, // FP16 super-block scale for quantized scales
+    dmin: u16, // FP16 super-block scale for quantized mins
+    scales: [12]u8, // scales and mins, quantized with 6 bits
+    qh: [32]u8, // quants, high bit
+    qs: [128]u8, // quants, low 4 bits
+    pub const BLOCK_SIZE = 256;
+    pub const BLOCK_BYTES = 176;
+};
+
+pub fn dequantizeQ5_K(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
+    const n_blocks = (n_elements + 255) / 256;
+    const out = try allocator.alloc(f32, n_blocks * 256);
+    const blocks: [*]const BlockQ5_K = @alignCast(@ptrCast(data));
+    for (0..n_blocks) |i| {
+        const d = f16ToF32(blocks[i].d);
+        const dmin = f16ToF32(blocks[i].dmin);
+
+        // Unpack scales and mins from 12 bytes
+        // sc[0..3] = s[0..3] & 0x3F
+        // sc[4..7] = (s[8..11] & 0x0F) | ((s[0..3] >> 2) & 0x30)
+        // min[0..3] = s[4..7] & 0x3F
+        // min[4..7] = (s[8..11] >> 4) | ((s[4..7] >> 2) & 0x30)
+        var sc: [8]u8 = undefined;
+        var min: [8]u8 = undefined;
+        const s = blocks[i].scales;
+        for (0..4) |k| {
+            sc[k] = s[k] & 0x3F;
+            min[k] = s[4 + k] & 0x3F;
+            sc[4 + k] = (s[8 + k] & 0x0F) | ((s[k] >> 2) & 0x30);
+            min[4 + k] = (s[8 + k] >> 4) | ((s[4 + k] >> 2) & 0x30);
+        }
+
+        for (0..256) |j| {
+            const sub_block = j / 32;
+            const offset = j % 32;
+            const low = (blocks[i].qs[j / 2] >> @as(u3, @intCast(4 * (j % 2)))) & 0xF;
+            const high = (blocks[i].qh[offset] >> @as(u3, @intCast(sub_block))) & 1;
+            const q = low | (high << 4);
+            out[i * 256 + j] = d * @as(f32, @floatFromInt(sc[sub_block])) * @as(f32, @floatFromInt(q)) -
+                dmin * @as(f32, @floatFromInt(min[sub_block]));
+        }
+    }
+    return out[0..n_elements];
+}
+
 // ========== Q6_K ==========
 pub const BlockQ6_K = extern struct {
     ql: [128]u8, // lower 4 bits
@@ -594,6 +641,7 @@ pub fn dequantize(allocator: std.mem.Allocator, data: [*]const u8, ggml_type: @i
         },
         .q8_0 => dequantizeQ8_0(allocator, data, n_elements),
         .q6_k => dequantizeQ6_K(allocator, data, n_elements),
+        .q5_k => dequantizeQ5_K(allocator, data, n_elements),
         .q4_k => dequantizeQ4_K(allocator, data, n_elements),
         .iq4_nl => dequantizeIQ4_NL(allocator, data, n_elements),
         .iq4_xs => dequantizeIQ4_XS(allocator, data, n_elements),

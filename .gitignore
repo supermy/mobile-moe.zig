@@ -2,3 +2,7 @@
 zig-out/
 .DS_Store
 *.gguf
+*.apk
+scripts/AI_Benchmark.apk
+check_*.py
+results/

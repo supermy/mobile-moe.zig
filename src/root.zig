@@ -24,7 +24,6 @@ const TokenId = tokenizer.TokenId;
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     engine: InferenceEngine,
-    gguf: GgufFile,
     active_session: Session,
 
     const Self = @This();
@@ -53,7 +52,6 @@ pub const Engine = struct {
         return .{
             .allocator = allocator,
             .engine = engine,
-            .gguf = gguf_file,
             .active_session = active_session,
         };
     }
@@ -61,7 +59,7 @@ pub const Engine = struct {
     pub fn deinit(self: *Self) void {
         self.active_session.deinit();
         self.engine.deinit();
-        // gguf 由 weights.deinit 释放
+        // GGUF 数据由 ModelWeights.deinit → GgufFile.deinit 统一释放
     }
 
     /// 创建新会话
@@ -159,10 +157,7 @@ pub const Session = struct {
 
     /// 同步 token 序列，自动 Prefix Caching
     pub fn sync(self: *Self, new_tokens: []const TokenId) !void {
-        // 1. 确保 block_table 容量足够
-        try self.engine.kv.ensureCapacity(@intCast(new_tokens.len));
-
-        // 2. 尝试 Prefix Caching
+        // 1. 尝试 Prefix Caching
         const reusable_blocks = self.engine.kv.findPrefixBlocks(new_tokens);
         if (reusable_blocks > 0) {
             try self.engine.kv.reusePrefixBlocks(new_tokens, reusable_blocks);
@@ -171,6 +166,9 @@ pub const Session = struct {
             self.engine.kv.reset();
             self.processed_len = 0;
         }
+
+        // 2. 确保 block_table 容量足够（reset 后需要重新分配）
+        try self.engine.kv.ensureCapacity(@intCast(new_tokens.len));
 
         // 3. 处理未缓存的 token（使用批量 forward）
         const start = self.processed_len;
