@@ -11,6 +11,14 @@ pub const inference = @import("inference.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const thermal = @import("thermal.zig");
 pub const kv_cache = @import("kv_cache.zig");
+pub const op_perf_db = @import("op_perf_db.zig");
+pub const sync = @import("sync.zig");
+pub const thread_pool = @import("thread_pool.zig");
+pub const batch_queue = @import("batch_queue.zig");
+pub const metal_backend = @import("metal_backend.zig");
+pub const opencl_backend = @import("opencl_backend.zig");
+pub const npu_analyzer = @import("npu_analyzer.zig");
+pub const hetero_executor = @import("hetero_executor.zig");
 
 const std = @import("std");
 const GgufFile = gguf.GgufFile;
@@ -37,15 +45,18 @@ pub const Engine = struct {
         var gguf_owned = true;
         errdefer if (gguf_owned) gguf_file.deinit();
 
-        const weights = try ModelWeights.init(allocator, gguf_file);
+        var weights = try ModelWeights.init(allocator, gguf_file);
         gguf_owned = false; // weights 现在拥有 gguf_file 的所有权
-        errdefer @constCast(&weights).deinit(allocator);
+        errdefer weights.deinit(allocator);
 
         var tok = try Tokenizer.init(allocator, &gguf_file);
         errdefer tok.deinit();
 
         var engine = try InferenceEngine.init(allocator, weights, tok, max_seq_len);
         errdefer engine.deinit();
+
+        // 默认开启 KV Cache Q8_0 量化，降低长序列内存占用
+        try engine.kv.enableQuantization();
 
         const active_session = try Session.init(allocator, &engine);
 
@@ -105,16 +116,13 @@ pub const Engine = struct {
     }
 
     /// 保存 KV 缓存到磁盘
-    /// TODO: 当前 block-based KV cache 的序列化尚未实现，需要保存 block_table、
-    /// blocks 元数据和 hash_map 才能正确恢复 Prefix Caching 状态。
-    pub fn saveKv(_: *Self, _: []const u8) !void {
-        return error.NotImplemented;
+    pub fn saveKv(self: *Self, path: []const u8) !void {
+        try self.engine.kv.saveToFile(path);
     }
 
     /// 从磁盘加载 KV 缓存
-    /// TODO: 与 saveKv 配对实现，当前直接返回未实现错误以避免状态不一致。
-    pub fn loadKv(_: *Self, _: []const u8) !void {
-        return error.NotImplemented;
+    pub fn loadKv(self: *Self, path: []const u8) !void {
+        try self.engine.kv.loadFromFile(path);
     }
 };
 
@@ -220,7 +228,7 @@ pub const Session = struct {
                 const start = bi * kv_cache.BLOCK_SIZE;
                 prefix_hash = kv_cache.computeHash(self.tokens.items[start..][0..kv_cache.BLOCK_SIZE], prefix_hash);
             }
-            self.engine.kv.cacheBlock(@intCast(block_idx), self.tokens.items[block_idx * kv_cache.BLOCK_SIZE..][0..kv_cache.BLOCK_SIZE], prefix_hash);
+            self.engine.kv.cacheBlock(@intCast(block_idx), self.tokens.items[block_idx * kv_cache.BLOCK_SIZE ..][0..kv_cache.BLOCK_SIZE], prefix_hash);
         }
 
         return next_token;
@@ -235,15 +243,13 @@ pub const Session = struct {
             self.engine.tok.bos_token;
 
         while (generated < max_tokens) : (generated += 1) {
+            if (last_token == self.engine.tok.eos_token) break;
+
             const pos = self.processed_len;
             const logits = try self.engine.forward(last_token, pos);
-            const next_token = self.engine.sampleGreedy(logits);
-
-            if (next_token == self.engine.tok.eos_token) break;
-
             try self.tokens.append(self.allocator, last_token);
             self.processed_len += 1;
-            last_token = next_token;
+            last_token = self.engine.sampleGreedy(logits);
 
             // 注册新满 block 的 hash
             const tokens_len = self.tokens.items.len;
@@ -254,29 +260,39 @@ pub const Session = struct {
                     const start = bi * kv_cache.BLOCK_SIZE;
                     prefix_hash = kv_cache.computeHash(self.tokens.items[start..][0..kv_cache.BLOCK_SIZE], prefix_hash);
                 }
-                self.engine.kv.cacheBlock(@intCast(block_idx), self.tokens.items[block_idx * kv_cache.BLOCK_SIZE..][0..kv_cache.BLOCK_SIZE], prefix_hash);
+                self.engine.kv.cacheBlock(@intCast(block_idx), self.tokens.items[block_idx * kv_cache.BLOCK_SIZE ..][0..kv_cache.BLOCK_SIZE], prefix_hash);
             }
         }
+
+        // 追加最后一个采样 token（若未因 EOS 跳出且未在循环内追加）
+        if (last_token != self.engine.tok.eos_token and self.tokens.items.len > 0 and self.tokens.items[self.tokens.items.len - 1] != last_token) {
+            try self.tokens.append(self.allocator, last_token);
+            self.processed_len += 1;
+        }
+
         return generated;
     }
 };
 
-fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const n = try std.posix.write(fd, data[offset..]);
-        if (n == 0) return error.UnexpectedEof;
-        offset += n;
-    }
-}
-
-fn readAll(fd: std.posix.fd_t, buf: []u8) !void {
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const n = try std.posix.read(fd, buf[offset..]);
-        if (n == 0) return error.EndOfStream;
-        offset += n;
-    }
+test {
+    // 引用所有子模块的测试（Zig 0.16 不会自动递归运行导入模块的测试）
+    _ = @import("gguf.zig");
+    _ = @import("model.zig");
+    _ = @import("dequant.zig");
+    _ = @import("tokenizer.zig");
+    _ = @import("math.zig");
+    _ = @import("inference.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("thermal.zig");
+    _ = @import("kv_cache.zig");
+    _ = @import("op_perf_db.zig");
+    _ = @import("sync.zig");
+    _ = @import("thread_pool.zig");
+    _ = @import("batch_queue.zig");
+    _ = @import("metal_backend.zig");
+    _ = @import("opencl_backend.zig");
+    _ = @import("npu_analyzer.zig");
+    _ = @import("hetero_executor.zig");
 }
 
 test "Session block hash chain" {

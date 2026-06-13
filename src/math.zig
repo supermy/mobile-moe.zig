@@ -124,6 +124,7 @@ pub fn softmax(out: []f32, x: []const f32) void {
 
 /// Top-K：从 scores 中选出前 k 个最大值的索引
 /// 返回排序后的 (index, score) 对，降序排列
+/// 时间复杂度 O(n log k)，使用最小堆，比全排序 O(n log n) 更高效
 pub const TopKEntry = struct { index: u32, score: f32 };
 
 pub fn topK(
@@ -132,23 +133,63 @@ pub fn topK(
     k: usize,
 ) ![]TopKEntry {
     std.debug.assert(k <= scores.len);
+    if (k == 0) return allocator.alloc(TopKEntry, 0);
 
-    var entries = try allocator.alloc(TopKEntry, scores.len);
-    defer allocator.free(entries);
+    // 使用最小堆（大小 k）维护前 k 大元素
+    var heap = try allocator.alloc(TopKEntry, k);
+    defer allocator.free(heap);
 
-    for (scores, 0..) |s, i| {
-        entries[i] = .{ .index = @intCast(i), .score = s };
+    for (0..k) |i| {
+        heap[i] = .{ .index = @intCast(i), .score = scores[i] };
     }
 
-    // Sort the ENTIRE array first (the actual top-k elements might be anywhere)
-    std.sort.block(TopKEntry, entries, {}, struct {
-        fn lessThan(_: void, a: TopKEntry, b: TopKEntry) bool {
-            return a.score > b.score; // 降序
-        }
-    }.lessThan);
+    // 建最小堆（按 score 升序，堆顶为当前第 k 大）
+    var i = k / 2;
+    while (i > 0) {
+        i -= 1;
+        siftDownMin(heap, i, k);
+    }
 
-    const result = try allocator.dupe(TopKEntry, entries[0..k]);
+    // 遍历剩余元素，若大于堆顶则替换
+    for (k..scores.len) |idx| {
+        if (scores[idx] > heap[0].score) {
+            heap[0] = .{ .index = @intCast(idx), .score = scores[idx] };
+            siftDownMin(heap, 0, k);
+        }
+    }
+
+    // 堆中即为前 k 大，按降序输出：逐个弹出堆顶放到结果末尾
+    const result = try allocator.alloc(TopKEntry, k);
+    errdefer allocator.free(result);
+
+    var ri = k;
+    while (ri > 0) {
+        ri -= 1;
+        result[ri] = heap[0];
+        heap[0] = heap[ri];
+        siftDownMin(heap, 0, ri);
+    }
+
     return result;
+}
+
+/// 最小堆下沉操作（按 score 升序）
+fn siftDownMin(heap: []TopKEntry, start: usize, end: usize) void {
+    var parent = start;
+    while (true) {
+        const left = parent * 2 + 1;
+        const right = left + 1;
+        var smallest = parent;
+        if (left < end and heap[left].score < heap[smallest].score) {
+            smallest = left;
+        }
+        if (right < end and heap[right].score < heap[smallest].score) {
+            smallest = right;
+        }
+        if (smallest == parent) break;
+        std.mem.swap(TopKEntry, &heap[parent], &heap[smallest]);
+        parent = smallest;
+    }
 }
 
 /// RoPE (Rotary Position Embedding) 预计算

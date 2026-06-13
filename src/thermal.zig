@@ -87,12 +87,20 @@ pub const ThrottleState = struct {
         }
     }
 
-    /// 读取 Android 热区温度
-    /// 遍历 /sys/class/thermal/thermal_zone*/temp 读取最高温度
+    /// 读取热区温度（跨平台）
+    /// Linux: 遍历 /sys/class/thermal/thermal_zone*/temp
+    /// macOS: 返回 0（TODO: 通过 IOKit 读取）
     pub fn readThermalZone(_: std.mem.Allocator) !i32 {
+        return switch (comptime @import("builtin").os.tag) {
+            .linux => readThermalZoneLinux(),
+            .macos => 0,
+            else => 0,
+        };
+    }
+
+    fn readThermalZoneLinux() !i32 {
         var max_temp: i32 = 0;
 
-        // 使用 POSIX API 直接打开目录
         const dir_fd = std.posix.openat(
             std.posix.AT.FDCWD,
             "/sys/class/thermal",
@@ -101,7 +109,6 @@ pub const ThrottleState = struct {
         ) catch return max_temp;
         defer std.posix.close(dir_fd);
 
-        // 读取目录条目
         var dir_buf: [2048]u8 align(@alignOf(std.posix.dirent)) = undefined;
         var offset: usize = 0;
         var consumed: usize = 0;
@@ -110,7 +117,7 @@ pub const ThrottleState = struct {
             if (consumed >= offset) {
                 const n = std.posix.getdents64(dir_fd, &dir_buf) catch return max_temp;
                 if (n == 0) break;
-                offset = 0;
+                offset = @intCast(n);
                 consumed = 0;
             }
             const entry: *std.posix.dirent = @ptrCast(@alignCast(&dir_buf[consumed]));
@@ -127,9 +134,7 @@ pub const ThrottleState = struct {
                 .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
                 0,
             ) catch continue;
-            defer {
-                _ = std.posix.system.close(fd);
-            }
+            defer std.posix.close(fd);
 
             var buf: [32]u8 = undefined;
             var total: usize = 0;

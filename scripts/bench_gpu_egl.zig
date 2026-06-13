@@ -131,15 +131,15 @@ pub fn main() !void {
         std.debug.print("eglInitialize failed\n", .{});
         return;
     }
-    std.debug.print("EGL version: {d}.{d}\n", .{major, minor});
+    std.debug.print("EGL version: {d}.{d}\n", .{ major, minor });
 
     const attribs = [_]EGLint{
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
+        EGL_RED_SIZE,        8,
+        EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,       8,
+        EGL_ALPHA_SIZE,      8,
         EGL_NONE,
     };
     var config: EGLConfig = null;
@@ -162,7 +162,7 @@ pub fn main() !void {
     }
 
     const surf_attribs = [_]EGLint{
-        EGL_WIDTH, 1,
+        EGL_WIDTH,  1,
         EGL_HEIGHT, 1,
         EGL_NONE,
     };
@@ -210,7 +210,7 @@ pub fn main() !void {
     std.debug.print("[2] Getting platform count...\n", .{});
     var num_platforms: cl_uint = 0;
     var ret = clGetPlatformIDs(0, null, &num_platforms);
-    std.debug.print("Platform count ret={d} num={d}\n", .{ret, num_platforms});
+    std.debug.print("Platform count ret={d} num={d}\n", .{ ret, num_platforms });
     if (ret != CL_SUCCESS or num_platforms == 0) {
         std.debug.print("No OpenCL platforms found\n", .{});
         return;
@@ -330,7 +330,7 @@ pub fn main() !void {
     const gflops = total_flops / (elapsed_s * 1e9);
 
     std.debug.print("=== GPU (OpenCL) Benchmark ===\n", .{});
-    std.debug.print("Matrix size: {d}x{d}\n", .{n, n});
+    std.debug.print("Matrix size: {d}x{d}\n", .{ n, n });
     std.debug.print("Iterations: {d}\n", .{ITERATIONS});
     std.debug.print("Total time: {d:.2} ms\n", .{elapsed_ms});
     std.debug.print("Per iteration: {d:.2} ms\n", .{elapsed_ms / @as(f64, @floatFromInt(ITERATIONS))});

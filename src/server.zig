@@ -28,7 +28,12 @@ fn handleRequest(
         defer allocator.free(generated);
 
         var response_buf: [4096]u8 = undefined;
-        const response = try std.fmt.bufPrint(&response_buf, "{{\"choices\":[{{\"message\":{{\"content\":\"{s}\"}}}}]}}\n", .{generated});
+        const response = buildJsonResponse(&response_buf, generated) catch |err| switch (err) {
+            error.NoSpaceLeft => {
+                try writer.writeAll("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            },
+        };
 
         var header_buf: [256]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{response.len});
@@ -42,23 +47,82 @@ fn handleRequest(
     }
 }
 
+/// 安全构建 JSON 响应，转义 content 中的特殊字符
+fn buildJsonResponse(buf: []u8, content: []const u8) error{NoSpaceLeft}![]u8 {
+    var off: usize = 0;
+    const prefix = "{\"choices\":[{\"message\":{\"content\":\"";
+    if (off + prefix.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[off..][0..prefix.len], prefix);
+    off += prefix.len;
+
+    for (content) |c| {
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |e| {
+            if (off + e.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[off..][0..e.len], e);
+            off += e.len;
+        } else if (c < 0x20) {
+            var hex_buf: [6]u8 = undefined;
+            const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{c}) catch return error.NoSpaceLeft;
+            if (off + hex.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[off..][0..hex.len], hex);
+            off += hex.len;
+        } else {
+            if (off + 1 > buf.len) return error.NoSpaceLeft;
+            buf[off] = c;
+            off += 1;
+        }
+    }
+
+    const suffix = "\"}}]}\n";
+    if (off + suffix.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[off..][0..suffix.len], suffix);
+    off += suffix.len;
+    return buf[0..off];
+}
+
 fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
-    const pattern = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":\"", .{key}) catch return null;
-    defer std.heap.page_allocator.free(pattern);
-    const start = std.mem.indexOf(u8, body, pattern) orelse return null;
-    const val_start = start + pattern.len;
-    const val_end = std.mem.indexOfScalar(u8, body[val_start..], '"') orelse return null;
-    return body[val_start..][0..val_end];
+    // 尝试匹配 "key":" 和 "key": "
+    var search_buf1: [256]u8 = undefined;
+    var search_buf2: [256]u8 = undefined;
+    const pattern_no_space = std.fmt.bufPrint(&search_buf1, "\"{s}\":\"", .{key}) catch return null;
+    const pattern_space = std.fmt.bufPrint(&search_buf2, "\"{s}\": \"", .{key}) catch return null;
+    const val_start = blk: {
+        if (std.mem.indexOf(u8, body, pattern_no_space)) |s| break :blk s + pattern_no_space.len;
+        if (std.mem.indexOf(u8, body, pattern_space)) |s| break :blk s + pattern_space.len;
+        return null;
+    };
+
+    // 解析值，处理转义引号 \"
+    var i = val_start;
+    while (i < body.len) {
+        if (body[i] == '\\' and i + 1 < body.len) {
+            i += 2; // 跳过转义字符
+            continue;
+        }
+        if (body[i] == '"') return body[val_start..i];
+        i += 1;
+    }
+    return null;
 }
 
 fn extractJsonInt(body: []const u8, key: []const u8) ?u32 {
-    const pattern = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":", .{key}) catch return null;
-    defer std.heap.page_allocator.free(pattern);
+    var search_buf: [256]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
     const start = std.mem.indexOf(u8, body, pattern) orelse return null;
-    const val_start = start + pattern.len;
-    var end = val_start;
+    var i = start + pattern.len;
+    // 跳过冒号后的空白
+    while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+    var end = i;
     while (end < body.len and std.ascii.isDigit(body[end])) : (end += 1) {}
-    return std.fmt.parseInt(u32, body[val_start..end], 10) catch null;
+    return std.fmt.parseInt(u32, body[i..end], 10) catch null;
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -100,7 +100,7 @@ pub fn main() !void {
     std.debug.print("[2] Getting platform count...\n", .{});
     var num_platforms: cl_uint = 0;
     var ret = clGetPlatformIDs(0, null, &num_platforms);
-    std.debug.print("Platform count ret={d} num={d}\n", .{ret, num_platforms});
+    std.debug.print("Platform count ret={d} num={d}\n", .{ ret, num_platforms });
     if (ret != CL_SUCCESS or num_platforms == 0) {
         std.debug.print("No OpenCL platforms found\n", .{});
         return;
@@ -109,7 +109,7 @@ pub fn main() !void {
     std.debug.print("[3] Getting platform...\n", .{});
     var platform: cl_platform_id = null;
     ret = clGetPlatformIDs(1, &platform, null);
-    std.debug.print("Platform ret={d} ptr={*}\n", .{ret, platform});
+    std.debug.print("Platform ret={d} ptr={*}\n", .{ ret, platform });
     if (ret != CL_SUCCESS) {
         std.debug.print("Failed to get OpenCL platform: {d}\n", .{ret});
         return;
@@ -118,7 +118,7 @@ pub fn main() !void {
     std.debug.print("[4] Getting device...\n", .{});
     var device: cl_device_id = null;
     ret = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, null);
-    std.debug.print("Device ret={d} ptr={*}\n", .{ret, device});
+    std.debug.print("Device ret={d} ptr={*}\n", .{ ret, device });
     if (ret != CL_SUCCESS) {
         std.debug.print("Failed to get GPU device: {d}\n", .{ret});
         return;
@@ -219,7 +219,7 @@ pub fn main() !void {
     const gflops = total_flops / (elapsed_s * 1e9);
 
     std.debug.print("=== GPU (OpenCL) Benchmark ===\n", .{});
-    std.debug.print("Matrix size: {d}x{d}\n", .{n, n});
+    std.debug.print("Matrix size: {d}x{d}\n", .{ n, n });
     std.debug.print("Iterations: {d}\n", .{ITERATIONS});
     std.debug.print("Total time: {d:.2} ms\n", .{elapsed_ms});
     std.debug.print("Per iteration: {d:.2} ms\n", .{elapsed_ms / @as(f64, @floatFromInt(ITERATIONS))});

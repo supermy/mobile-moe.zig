@@ -115,8 +115,12 @@ pub fn quantizeQ8_0(allocator: std.mem.Allocator, data: []const f32) ![]BlockQ8_
         for (0..32) |j| {
             const idx = i * 32 + j;
             if (idx < n_elements) {
-                const q = @round(data[idx] / d);
-                blocks[i].qs[j] = @intCast(std.math.clamp(q, -127, 127));
+                if (d > 0) {
+                    const q = @round(data[idx] / d);
+                    blocks[i].qs[j] = @intCast(std.math.clamp(q, -127, 127));
+                } else {
+                    blocks[i].qs[j] = 0;
+                }
             } else {
                 blocks[i].qs[j] = 0;
             }
@@ -214,7 +218,7 @@ pub const kmask_iq2xs = [8]u8{ 1, 2, 4, 8, 16, 32, 64, 128 };
 // IQ4_NL / IQ4_XS 查找表：4-bit 索引 → 非线性 int8 值
 pub const kvalues_iq4nl = [16]i8{
     -127, -104, -83, -65, -49, -35, -22, -10,
-    1, 13, 25, 38, 53, 69, 89, 113,
+    1,    13,   25,  38,  53,  69,  89,  113,
 };
 
 // IQ3_S 查找表：512 项，每项打包 4 个 int8 值
@@ -287,13 +291,13 @@ pub const iq3s_grid = [512]u32{
 
 // 符号查找表：从 uint16_t 索引提取 8 个符号位
 pub const ksigns_iq2xs = [128]u8{
-    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
-    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
-    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
-    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
-    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
-    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
-    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    0,   129, 130, 3,   132, 5,   6,   135, 136, 9,   10,  139, 12,  141, 142, 15,
+    144, 17,  18,  147, 20,  149, 150, 23,  24,  153, 154, 27,  156, 29,  30,  159,
+    160, 33,  34,  163, 36,  165, 166, 39,  40,  169, 170, 43,  172, 45,  46,  175,
+    48,  177, 178, 51,  180, 53,  54,  183, 184, 57,  58,  187, 60,  189, 190, 63,
+    192, 65,  66,  195, 68,  197, 198, 71,  72,  201, 202, 75,  204, 77,  78,  207,
+    80,  209, 210, 83,  212, 85,  86,  215, 216, 89,  90,  219, 92,  221, 222, 95,
+    96,  225, 226, 99,  228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
@@ -355,7 +359,7 @@ pub fn dequantizeIQ2XXS(allocator: std.mem.Allocator, data: [*]const u8, n_eleme
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
 
-    const blocks: [*]const BlockIQ2XXS = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockIQ2XXS = @ptrCast(@alignCast(data));
 
     for (0..n_blocks) |i| {
         dequantizeBlock(&blocks[i], out[i * 256 ..]);
@@ -375,7 +379,7 @@ pub const BlockQ8_0 = extern struct {
 pub fn dequantizeQ8_0(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 31) / 32;
     const out = try allocator.alloc(f32, n_blocks * 32);
-    const blocks: [*]const BlockQ8_0 = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockQ8_0 = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         for (0..32) |j| {
@@ -399,7 +403,7 @@ pub const BlockQ5_K = extern struct {
 pub fn dequantizeQ5_K(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
-    const blocks: [*]const BlockQ5_K = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockQ5_K = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         const dmin = f16ToF32(blocks[i].dmin);
@@ -445,7 +449,7 @@ pub const BlockQ6_K = extern struct {
 pub fn dequantizeQ6_K(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
-    const blocks: [*]const BlockQ6_K = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockQ6_K = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         var y_off: usize = i * 256;
@@ -484,7 +488,7 @@ pub const BlockIQ4_NL = extern struct {
 pub fn dequantizeIQ4_NL(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 31) / 32;
     const out = try allocator.alloc(f32, n_blocks * 32);
-    const blocks: [*]const BlockIQ4_NL = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockIQ4_NL = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         for (0..16) |j| {
@@ -509,7 +513,7 @@ pub const BlockIQ4_XS = extern struct {
 pub fn dequantizeIQ4_XS(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
-    const blocks: [*]const BlockIQ4_XS = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockIQ4_XS = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         var y_off: usize = i * 256;
@@ -553,7 +557,7 @@ inline fn getScaleMinK4(j: usize, q: [*]const u8, d: *u8, m: *u8) void {
 pub fn dequantizeQ4_K(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
-    const blocks: [*]const BlockQ4_K = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockQ4_K = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         const min = f16ToF32(blocks[i].dmin);
@@ -598,7 +602,7 @@ pub const BlockIQ3_S = extern struct {
 pub fn dequantizeIQ3_S(allocator: std.mem.Allocator, data: [*]const u8, n_elements: u64) ![]f32 {
     const n_blocks = (n_elements + 255) / 256;
     const out = try allocator.alloc(f32, n_blocks * 256);
-    const blocks: [*]const BlockIQ3_S = @alignCast(@ptrCast(data));
+    const blocks: [*]const BlockIQ3_S = @ptrCast(@alignCast(data));
     for (0..n_blocks) |i| {
         const d = f16ToF32(blocks[i].d);
         var y_off: usize = i * 256;
@@ -628,11 +632,11 @@ pub fn dequantizeIQ3_S(allocator: std.mem.Allocator, data: [*]const u8, n_elemen
 pub fn dequantize(allocator: std.mem.Allocator, data: [*]const u8, ggml_type: @import("gguf.zig").GgmlType, n_elements: u64) ![]f32 {
     return switch (ggml_type) {
         .f32 => {
-            const src: [*]const f32 = @alignCast(@ptrCast(data));
+            const src: [*]const f32 = @ptrCast(@alignCast(data));
             return allocator.dupe(f32, src[0..n_elements]);
         },
         .f16 => {
-            const src: [*]const u16 = @alignCast(@ptrCast(data));
+            const src: [*]const u16 = @ptrCast(@alignCast(data));
             const out = try allocator.alloc(f32, n_elements);
             for (out, 0..) |*o, i| {
                 o.* = f16ToF32(src[i]);

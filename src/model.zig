@@ -354,9 +354,11 @@ pub const ModelWeights = struct {
         }
         if (self.bindTensor(L.fmt(&buf, layer, "ffn_up.weight"))) |t| {
             lw.dense_up = t.ptr;
+            lw.dense_type = t.ggml_type;
         }
         if (self.bindTensor(L.fmt(&buf, layer, "ffn_down.weight"))) |t| {
             lw.dense_down = t.ptr;
+            lw.dense_type = t.ggml_type;
         }
 
         // 共享专家
@@ -366,9 +368,11 @@ pub const ModelWeights = struct {
         }
         if (self.bindTensor(L.fmt(&buf, layer, "ffn_up_shexp.weight"))) |t| {
             lw.shared_up = t.ptr;
+            lw.shared_type = t.ggml_type;
         }
         if (self.bindTensor(L.fmt(&buf, layer, "ffn_down_shexp.weight"))) |t| {
             lw.shared_down = t.ptr;
+            lw.shared_type = t.ggml_type;
         }
 
         // 路由专家（连续存储）

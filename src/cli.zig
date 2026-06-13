@@ -35,19 +35,20 @@ pub fn main(init: std.process.Init) !void {
         const info = try detect.detect(allocator);
         defer detect.deinit(info, allocator);
         var buf: [4096]u8 = undefined;
-        const written = try std.fmt.bufPrint(&buf,
+        const written = try std.fmt.bufPrint(
+            &buf,
             "=== CPU 检测 ===\n" ++
-            "  架构:       {s}\n" ++
-            "  品牌:       {s}\n" ++
-            "  逻辑核心:   {d}\n" ++
-            "  物理核心:   {d}\n" ++
-            "  设备型号:   {s}\n" ++
-            "\n=== GPU 检测 ===\n" ++
-            "  名称:       {s}\n" ++
-            "  Metal 支持: {s}\n" ++
-            "\n=== NPU 检测 ===\n" ++
-            "  可用:       {s}\n" ++
-            "  名称:       {s}\n",
+                "  架构:       {s}\n" ++
+                "  品牌:       {s}\n" ++
+                "  逻辑核心:   {d}\n" ++
+                "  物理核心:   {d}\n" ++
+                "  设备型号:   {s}\n" ++
+                "\n=== GPU 检测 ===\n" ++
+                "  名称:       {s}\n" ++
+                "  Metal 支持: {s}\n" ++
+                "\n=== NPU 检测 ===\n" ++
+                "  可用:       {s}\n" ++
+                "  名称:       {s}\n",
             .{
                 info.cpu_arch,
                 info.cpu_brand,
@@ -68,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var max_tokens: u32 = 512;
     var max_seq_len: u32 = 4096;
     var benchmark = false;
+    var load_kv_path: ?[]const u8 = null;
 
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--max-tokens")) {
@@ -78,12 +80,22 @@ pub fn main(init: std.process.Init) !void {
             max_seq_len = try std.fmt.parseInt(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--benchmark")) {
             benchmark = true;
+        } else if (std.mem.eql(u8, arg, "--load-kv")) {
+            load_kv_path = args_iter.next() orelse return;
         }
     }
 
     std.debug.print("加载模型: {s}\n", .{model_path});
     var engine = try mobile_moe.Engine.load(allocator, model_path, max_seq_len, false);
     defer engine.deinit();
+
+    // 启动时加载 KV 缓存（如果指定）
+    if (load_kv_path) |path| {
+        std.debug.print("加载 KV 缓存: {s}\n", .{path});
+        engine.loadKv(path) catch |err| {
+            std.debug.print("警告: 加载 KV 缓存失败: {any}\n", .{err});
+        };
+    }
 
     const hp = engine.engine.weights.hp;
     std.debug.print("模型: GLM-4.7-Flash (DeepSeek2 架构)\n", .{});
@@ -106,7 +118,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // REPL 模式
-    std.debug.print("\n输入提示词开始对话 (Ctrl+C 退出)\n\n", .{});
+    std.debug.print("\n输入提示词开始对话 (Ctrl+C 退出)\n", .{});
+    std.debug.print("命令: /save-kv <path>  保存 KV 缓存\n", .{});
+    std.debug.print("       /load-kv <path>  加载 KV 缓存\n", .{});
+    std.debug.print("       /reset             重置会话\n\n", .{});
 
     var input_buf: [4096]u8 = undefined;
     while (true) {
@@ -117,6 +132,41 @@ pub fn main(init: std.process.Init) !void {
         if (n == 0) break;
         const line = std.mem.trimEnd(u8, input_buf[0..n], "\n\r ");
         if (line.len == 0) continue;
+
+        // REPL 命令
+        if (std.mem.startsWith(u8, line, "/save-kv ")) {
+            const path = std.mem.trim(u8, line["/save-kv ".len..], " \t");
+            if (path.len == 0) {
+                std.debug.print("用法: /save-kv <path>\n", .{});
+                continue;
+            }
+            engine.saveKv(path) catch |err| {
+                std.debug.print("保存 KV 缓存失败: {any}\n", .{err});
+                continue;
+            };
+            std.debug.print("KV 缓存已保存到 {s}\n", .{path});
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "/load-kv ")) {
+            const path = std.mem.trim(u8, line["/load-kv ".len..], " \t");
+            if (path.len == 0) {
+                std.debug.print("用法: /load-kv <path>\n", .{});
+                continue;
+            }
+            engine.loadKv(path) catch |err| {
+                std.debug.print("加载 KV 缓存失败: {any}\n", .{err});
+                continue;
+            };
+            std.debug.print("KV 缓存已从 {s} 加载\n", .{path});
+            continue;
+        }
+
+        if (std.mem.eql(u8, line, "/reset")) {
+            engine.session(.{});
+            std.debug.print("会话已重置\n", .{});
+            continue;
+        }
 
         engine.session(.{});
 

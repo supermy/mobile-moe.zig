@@ -56,7 +56,7 @@ pub fn main() !void {
     const gflops = total_flops / (elapsed_s * 1e9);
 
     std.debug.print("=== CPU Benchmark ===\n", .{});
-    std.debug.print("Matrix size: {d}x{d}\n", .{n, n});
+    std.debug.print("Matrix size: {d}x{d}\n", .{ n, n });
     std.debug.print("Iterations: {d}\n", .{ITERATIONS});
     std.debug.print("Total time: {d:.2} ms\n", .{elapsed_ms});
     std.debug.print("Per iteration: {d:.2} ms\n", .{elapsed_ms / @as(f64, @floatFromInt(ITERATIONS))});

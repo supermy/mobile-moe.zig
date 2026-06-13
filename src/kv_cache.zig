@@ -197,7 +197,7 @@ pub const KVCache = struct {
     pub fn truncate(self: *Self, n_tokens: u32) void {
         const needed_blocks = (n_tokens + self.block_size - 1) / self.block_size;
         while (self.block_table.items.len > needed_blocks) {
-            const bid = self.block_table.pop();
+            const bid = self.block_table.pop().?;
             self.releaseBlock(bid);
         }
         if (n_tokens < self.len) {
@@ -301,11 +301,17 @@ pub const KVCache = struct {
                 }
                 const d = if (max_abs > 0) max_abs / 127.0 else 0.0;
                 kv_blocks[bi].d = dequant.f32ToF16(d);
-                for (start..end, 0..) |vi, qi| {
-                    var q_i = @as(i32, @intFromFloat(@round(kv_comp[vi] / d)));
-                    if (q_i > 127) q_i = 127;
-                    if (q_i < -127) q_i = -127;
-                    kv_blocks[bi].qs[qi] = @intCast(q_i);
+                if (d > 0) {
+                    for (start..end, 0..) |vi, qi| {
+                        var q_i = @as(i32, @intFromFloat(@round(kv_comp[vi] / d)));
+                        if (q_i > 127) q_i = 127;
+                        if (q_i < -127) q_i = -127;
+                        kv_blocks[bi].qs[qi] = @intCast(q_i);
+                    }
+                } else {
+                    for (start..end, 0..) |_, qi| {
+                        kv_blocks[bi].qs[qi] = 0;
+                    }
                 }
                 for (end - start..32) |qi| {
                     kv_blocks[bi].qs[qi] = 0;
@@ -325,11 +331,17 @@ pub const KVCache = struct {
                 }
                 const d = if (max_abs > 0) max_abs / 127.0 else 0.0;
                 pe_blocks[bi].d = dequant.f32ToF16(d);
-                for (start..end, 0..) |vi, qi| {
-                    var q_i = @as(i32, @intFromFloat(@round(k_pe_val[vi] / d)));
-                    if (q_i > 127) q_i = 127;
-                    if (q_i < -127) q_i = -127;
-                    pe_blocks[bi].qs[qi] = @intCast(q_i);
+                if (d > 0) {
+                    for (start..end, 0..) |vi, qi| {
+                        var q_i = @as(i32, @intFromFloat(@round(k_pe_val[vi] / d)));
+                        if (q_i > 127) q_i = 127;
+                        if (q_i < -127) q_i = -127;
+                        pe_blocks[bi].qs[qi] = @intCast(q_i);
+                    }
+                } else {
+                    for (start..end, 0..) |_, qi| {
+                        pe_blocks[bi].qs[qi] = 0;
+                    }
                 }
                 for (end - start..32) |qi| {
                     pe_blocks[bi].qs[qi] = 0;
@@ -434,7 +446,149 @@ pub const KVCache = struct {
     pub fn numFreeBlocks(self: *const Self) u32 {
         return @intCast(self.free_list.items.len);
     }
+
+    // ========== 磁盘持久化 ==========
+
+    /// 将当前 KV Cache 状态保存到文件（简单格式：header + block_table + 完整物理块池）
+    pub fn saveToFile(self: *const Self, path: []const u8) !void {
+        const fd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            path,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            0o644,
+        );
+        errdefer _ = std.posix.system.close(fd);
+        defer _ = std.posix.system.close(fd);
+
+        const header = CheckpointHeader{
+            .magic = .{ 'K', 'V', 'C', 'K' },
+            .version = 1,
+            .len = self.len,
+            .quantized = if (self.quantized) 1 else 0,
+            .block_table_len = @intCast(self.block_table.items.len),
+            .num_layers = self.hp.num_hidden_layers,
+            .num_blocks = self.num_blocks,
+            .block_size = self.block_size,
+            .kv_rank = self.hp.kv_lora_rank,
+            .rope_dim = self.hp.qk_rope_head_dim,
+        };
+        try writeAll(fd, std.mem.asBytes(&header));
+
+        // block_table
+        for (self.block_table.items) |bid| {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, bid, .little);
+            try writeAll(fd, &buf);
+        }
+
+        if (self.quantized) {
+            const kv_q8_per_token = (self.hp.kv_lora_rank + 31) / 32;
+            const pe_q8_per_token = (self.hp.qk_rope_head_dim + 31) / 32;
+            const total_tokens = self.hp.num_hidden_layers * self.num_blocks * self.block_size;
+            try writeAll(fd, std.mem.sliceAsBytes(self.kv_q8.?[0 .. total_tokens * kv_q8_per_token]));
+            try writeAll(fd, std.mem.sliceAsBytes(self.k_pe_q8.?[0 .. total_tokens * pe_q8_per_token]));
+        } else {
+            try writeAll(fd, std.mem.sliceAsBytes(self.kv_compressed));
+            try writeAll(fd, std.mem.sliceAsBytes(self.k_pe));
+        }
+    }
+
+    /// 从文件加载 KV Cache 状态（覆盖当前状态）
+    pub fn loadFromFile(self: *Self, path: []const u8) !void {
+        const fd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            path,
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+            0,
+        );
+        errdefer _ = std.posix.system.close(fd);
+        defer _ = std.posix.system.close(fd);
+
+        var header: CheckpointHeader = undefined;
+        try readNoEof(fd, std.mem.asBytes(&header));
+        if (!std.mem.eql(u8, &header.magic, "KVCK")) return error.InvalidCheckpointMagic;
+        if (header.version != 1) return error.UnsupportedCheckpointVersion;
+        if (header.num_layers != self.hp.num_hidden_layers or
+            header.num_blocks != self.num_blocks or
+            header.block_size != self.block_size or
+            header.kv_rank != self.hp.kv_lora_rank or
+            header.rope_dim != self.hp.qk_rope_head_dim)
+        {
+            return error.CheckpointShapeMismatch;
+        }
+
+        self.len = header.len;
+
+        // 释放旧 block_table，重建
+        for (self.block_table.items) |bid| {
+            self.releaseBlock(bid);
+        }
+        self.block_table.clearRetainingCapacity();
+        for (0..header.block_table_len) |_| {
+            var buf: [4]u8 = undefined;
+            try readNoEof(fd, &buf);
+            const bid = std.mem.readInt(u32, &buf, .little);
+            self.retainBlock(bid);
+            try self.block_table.append(self.allocator, bid);
+        }
+
+        if (header.quantized == 1) {
+            if (!self.quantized) try self.enableQuantization();
+            const kv_q8_per_token = (self.hp.kv_lora_rank + 31) / 32;
+            const pe_q8_per_token = (self.hp.qk_rope_head_dim + 31) / 32;
+            const total_tokens = self.hp.num_hidden_layers * self.num_blocks * self.block_size;
+            try readNoEof(fd, std.mem.sliceAsBytes(self.kv_q8.?[0 .. total_tokens * kv_q8_per_token]));
+            try readNoEof(fd, std.mem.sliceAsBytes(self.k_pe_q8.?[0 .. total_tokens * pe_q8_per_token]));
+        } else {
+            try readNoEof(fd, std.mem.sliceAsBytes(self.kv_compressed));
+            try readNoEof(fd, std.mem.sliceAsBytes(self.k_pe));
+        }
+    }
 };
+
+const CheckpointHeader = extern struct {
+    magic: [4]u8,
+    version: u32,
+    len: u32,
+    quantized: u8,
+    block_table_len: u32,
+    num_layers: u32,
+    num_blocks: u32,
+    block_size: u32,
+    kv_rank: u32,
+    rope_dim: u32,
+};
+
+fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const rc = std.posix.system.write(fd, buf[offset..].ptr, buf.len - offset);
+        if (rc < 0) {
+            switch (std.posix.errno(rc)) {
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.Unexpected,
+                .IO => return error.InputOutput,
+                .NOBUFS => return error.SystemResources,
+                .NOMEM => return error.SystemResources,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .PIPE => return error.BrokenPipe,
+                else => return error.Unexpected,
+            }
+        }
+        if (rc == 0) return error.WriteFailed;
+        offset += @intCast(rc);
+    }
+}
+
+fn readNoEof(fd: std.posix.fd_t, buf: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try std.posix.read(fd, buf[offset..]);
+        if (n == 0) return error.EndOfStream;
+        offset += n;
+    }
+}
 
 /// 计算 block 的链式 xxHash64（模块级辅助函数）
 /// token_ids: 该 block 中的 token ID
@@ -452,4 +606,237 @@ pub fn computeHash(token_ids: []const u32, prefix_hash: u64) u64 {
         hasher.update(&bytes);
     }
     return hasher.final();
+}
+
+// ========== TDD 测试 ==========
+
+const testing = std.testing;
+
+fn testHyperParams() HyperParams {
+    return .{
+        .hidden_size = 64,
+        .intermediate_size = 128,
+        .moe_intermediate_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 1,
+        .vocab_size = 1000,
+        .max_position_embeddings = 512,
+        .kv_lora_rank = 16,
+        .q_lora_rank = 16,
+        .qk_rope_head_dim = 8,
+        .qk_nope_head_dim = 8,
+        .v_head_dim = 16,
+        .n_routed_experts = 4,
+        .n_shared_experts = 1,
+        .num_experts_per_tok = 2,
+        .routed_scaling_factor = 1.0,
+        .norm_topk_prob = true,
+        .leading_dense_block_count = 1,
+        .rms_norm_eps = 1e-5,
+        .rope_freq_base = 1e6,
+        .rope_dimension_count = 8,
+        .head_dim = 16,
+    };
+}
+
+test "KVCache init and basic operations" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+
+    try testing.expectEqual(@as(u32, 4), kv.num_blocks); // (64 + 15) / 16 = 4
+    try testing.expectEqual(@as(u32, 4), kv.numFreeBlocks());
+    try testing.expectEqual(@as(u32, 0), kv.len);
+
+    try kv.ensureCapacity(20);
+    try testing.expectEqual(@as(u32, 2), kv.block_table.items.len); // ceil(20/16)=2
+    try testing.expectEqual(@as(u32, 2), kv.numFreeBlocks());
+}
+
+test "KVCache put and get" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+
+    try kv.ensureCapacity(4);
+
+    var kv_comp = try testing.allocator.alloc(f32, hp.kv_lora_rank);
+    defer testing.allocator.free(kv_comp);
+    for (0..hp.kv_lora_rank) |i| kv_comp[i] = @floatFromInt(i);
+
+    var k_pe_val = try testing.allocator.alloc(f32, hp.qk_rope_head_dim);
+    defer testing.allocator.free(k_pe_val);
+    for (0..hp.qk_rope_head_dim) |i| k_pe_val[i] = @floatFromInt(i + 100);
+
+    try kv.put(0, 0, kv_comp, k_pe_val);
+    try testing.expectEqual(@as(u32, 1), kv.len);
+
+    const got_kv = try kv.getKVCompressed(0, 0);
+    for (0..hp.kv_lora_rank) |i| {
+        try testing.expectEqual(@as(f32, @floatFromInt(i)), got_kv[i]);
+    }
+
+    const got_pe = try kv.getKPe(0, 0);
+    for (0..hp.qk_rope_head_dim) |i| {
+        try testing.expectEqual(@as(f32, @floatFromInt(i + 100)), got_pe[i]);
+    }
+}
+
+test "KVCache quantization roundtrip" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+    try kv.enableQuantization();
+    try testing.expect(kv.quantized);
+
+    try kv.ensureCapacity(4);
+
+    var kv_comp = try testing.allocator.alloc(f32, hp.kv_lora_rank);
+    defer testing.allocator.free(kv_comp);
+    for (0..hp.kv_lora_rank) |i| kv_comp[i] = 0.5 * @as(f32, @floatFromInt(i));
+
+    var k_pe_val = try testing.allocator.alloc(f32, hp.qk_rope_head_dim);
+    defer testing.allocator.free(k_pe_val);
+    for (0..hp.qk_rope_head_dim) |i| k_pe_val[i] = 0.25 * @as(f32, @floatFromInt(i));
+
+    try kv.put(0, 0, kv_comp, k_pe_val);
+
+    const got_kv = try kv.getKVCompressed(0, 0);
+    const got_pe = try kv.getKPe(0, 0);
+
+    // Q8_0 量化误差应小于 5%（小值相对误差较大，用绝对阈值兜底）
+    for (0..hp.kv_lora_rank) |i| {
+        const expected: f32 = 0.5 * @as(f32, @floatFromInt(i));
+        const diff = @abs(got_kv[i] - expected);
+        try testing.expect(diff < 0.05 * @abs(expected) + 1e-2);
+    }
+    for (0..hp.qk_rope_head_dim) |i| {
+        const expected: f32 = 0.25 * @as(f32, @floatFromInt(i));
+        const diff = @abs(got_pe[i] - expected);
+        try testing.expect(diff < 0.05 * @abs(expected) + 1e-2);
+    }
+}
+
+test "KVCache save/load non-quantized" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+
+    try kv.ensureCapacity(4);
+
+    var kv_comp = try testing.allocator.alloc(f32, hp.kv_lora_rank);
+    defer testing.allocator.free(kv_comp);
+    for (0..hp.kv_lora_rank) |i| kv_comp[i] = @floatFromInt(i);
+
+    var k_pe_val = try testing.allocator.alloc(f32, hp.qk_rope_head_dim);
+    defer testing.allocator.free(k_pe_val);
+    for (0..hp.qk_rope_head_dim) |i| k_pe_val[i] = @floatFromInt(i + 100);
+
+    try kv.put(0, 0, kv_comp, k_pe_val);
+    try kv.put(1, 1, kv_comp, k_pe_val);
+
+    const test_path = "test_kv_nonq.bin";
+    try kv.saveToFile(test_path);
+    defer _ = std.c.unlink(test_path);
+
+    // 加载到新实例
+    var kv2 = try KVCache.init(testing.allocator, hp, 64);
+    defer kv2.deinit();
+    try kv2.loadFromFile(test_path);
+
+    try testing.expectEqual(kv.len, kv2.len);
+    try testing.expectEqualSlices(u32, kv.block_table.items, kv2.block_table.items);
+
+    // 验证数据
+    const got_kv = try kv2.getKVCompressed(0, 0);
+    const got_pe = try kv2.getKPe(0, 0);
+    for (0..hp.kv_lora_rank) |i| {
+        try testing.expectEqual(kv_comp[i], got_kv[i]);
+    }
+    for (0..hp.qk_rope_head_dim) |i| {
+        try testing.expectEqual(k_pe_val[i], got_pe[i]);
+    }
+}
+
+test "KVCache save/load quantized" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+    try kv.enableQuantization();
+
+    try kv.ensureCapacity(4);
+
+    var kv_comp = try testing.allocator.alloc(f32, hp.kv_lora_rank);
+    defer testing.allocator.free(kv_comp);
+    for (0..hp.kv_lora_rank) |i| kv_comp[i] = 0.5 * @as(f32, @floatFromInt(i));
+
+    var k_pe_val = try testing.allocator.alloc(f32, hp.qk_rope_head_dim);
+    defer testing.allocator.free(k_pe_val);
+    for (0..hp.qk_rope_head_dim) |i| k_pe_val[i] = 0.25 * @as(f32, @floatFromInt(i));
+
+    try kv.put(0, 0, kv_comp, k_pe_val);
+    try kv.put(1, 1, kv_comp, k_pe_val);
+
+    const test_path = "test_kv_q.bin";
+    try kv.saveToFile(test_path);
+    defer _ = std.c.unlink(test_path);
+
+    var kv2 = try KVCache.init(testing.allocator, hp, 64);
+    defer kv2.deinit();
+    try kv2.loadFromFile(test_path);
+
+    try testing.expect(kv2.quantized);
+    try testing.expectEqual(kv.len, kv2.len);
+    try testing.expectEqualSlices(u32, kv.block_table.items, kv2.block_table.items);
+}
+
+test "KVCache checkpoint magic/version mismatch" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+
+    const test_path = "test_kv_bad.bin";
+    const fd = try std.posix.openat(
+        std.posix.AT.FDCWD,
+        test_path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+        0o644,
+    );
+    defer _ = std.posix.system.close(fd);
+
+    // 写入一个完整但 magic 错误的 header
+    const bad_header = CheckpointHeader{
+        .magic = .{ 'B', 'A', 'D', '!' },
+        .version = 1,
+        .len = 0,
+        .quantized = 0,
+        .block_table_len = 0,
+        .num_layers = hp.num_hidden_layers,
+        .num_blocks = 4,
+        .block_size = BLOCK_SIZE,
+        .kv_rank = hp.kv_lora_rank,
+        .rope_dim = hp.qk_rope_head_dim,
+    };
+    try writeAll(fd, std.mem.asBytes(&bad_header));
+    defer _ = std.c.unlink(test_path);
+
+    try testing.expectError(error.InvalidCheckpointMagic, kv.loadFromFile(test_path));
+}
+
+test "KVCache truncate and reset" {
+    const hp = testHyperParams();
+    var kv = try KVCache.init(testing.allocator, hp, 64);
+    defer kv.deinit();
+
+    try kv.ensureCapacity(35); // 3 blocks
+    try testing.expectEqual(@as(u32, 3), kv.block_table.items.len);
+
+    kv.truncate(16); // 1 block needed
+    try testing.expectEqual(@as(u32, 1), kv.block_table.items.len);
+
+    kv.reset();
+    try testing.expectEqual(@as(u32, 0), kv.block_table.items.len);
+    try testing.expectEqual(@as(u32, 0), kv.len);
+    try testing.expectEqual(@as(u32, 4), kv.numFreeBlocks());
 }

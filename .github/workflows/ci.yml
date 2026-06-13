@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test-native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build CLI (native)
+        run: zig build -Doptimize=ReleaseFast
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android
+          - aarch64-macos
+          - x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Cross compile CLI
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Cross compile server
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+  lint-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check src/ tests/ scripts/
